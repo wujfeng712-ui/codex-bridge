@@ -19,7 +19,7 @@
   <a href="./README.es.md">Español</a>
 </p>
 
----
+***
 
 Codex CLI 使用 **OpenAI Responses API**，而 DeepSeek 和 MiMo 使用 **Chat Completions**。
 codex-bridge 在两者之间双向转换 —— 包含流式 SSE、工具调用与思考模式回合，让你在不修改 Codex 客户端的前提下使用任意支持的模型。
@@ -32,7 +32,7 @@ codex-bridge 在两者之间双向转换 —— 包含流式 SSE、工具调用�
 - **思考模式 + 工具调用回合** —— 缓存并回放 `reasoning_content`，使 DeepSeek 的思考模式跨多轮工具调用保持一致
 - **入站鉴权** —— 支持 `PROXY_AUTH_KEY` / `PROXY_KEYS`，可按密钥锁定供应商
 - **会话延续** —— `previous_response_id` 跨供应商可用（基于 LRU 上限的存储）
-- **内置 `web_fetch` 工具** —— 在 URL 密集场景下绕过沙箱限制
+- **内置** **`web_fetch`** **工具** —— 在 URL 密集场景下绕过沙箱限制
 - **工具调用熔断器** —— 软警告 + 硬剥离，防止工具调用死循环
 - **单文件零依赖** —— 仅一个 `proxy.mjs`（约 2000 行），无需 `npm install`
 
@@ -83,7 +83,7 @@ requires_openai_auth = true
 { "OPENAI_API_KEY": "<同 .env 中的 PROXY_AUTH_KEY>" }
 ```
 
-> **使用 [CC Switch](https://github.com/farion1231/cc-switch)？** 无需手动编辑，直接在 GUI 中添加供应商即可。详见 [配合 CC Switch 使用](#配合-cc-switch-使用)。
+> **使用** **[CC Switch](https://github.com/farion1231/cc-switch)？** 无需手动编辑，直接在 GUI 中添加供应商即可。详见 [配合 CC Switch 使用](#配合-cc-switch-使用)。
 
 运行 `codex` —— 完成。
 
@@ -110,46 +110,46 @@ requires_openai_auth = true
 
 ### 鉴权
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `PROXY_AUTH_KEY` | — | 单一入站密钥（不锁定供应商） |
-| `PROXY_KEYS` | — | 多密钥表：`<key>:<provider>,...`，provider ∈ `deepseek` / `mimo` / `openai` / `*` |
+| 变量               | 默认值 | 说明                                                                          |
+| ---------------- | --- | --------------------------------------------------------------------------- |
+| `PROXY_AUTH_KEY` | —   | 单一入站密钥（不锁定供应商）                                                              |
+| `PROXY_KEYS`     | —   | 多密钥表：`<key>:<provider>,...`，provider ∈ `deepseek` / `mimo` / `openai` / `*` |
 
 两者均空 = 关闭鉴权（不推荐）。
 
 ### 上游供应商
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `DEEPSEEK_API_KEY` | — | DeepSeek 上游密钥 |
-| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com/v1` | DeepSeek base URL |
-| `DEEPSEEK_MODELS` | `deepseek-v4-pro,deepseek-v4-flash` | 对外暴露的模型列表 |
-| `MIMO_API_KEY` | — | 小米 MiMo 上游密钥 |
-| `MIMO_BASE_URL` | `https://token-plan-cn.xiaomimimo.com/v1` | MiMo base URL |
-| `MIMO_MODELS` | `mimo-v2.5-pro` | 对外暴露的模型列表（**必须小写**） |
-| `OPENAI_API_KEY` | — | OpenAI 上游密钥（可选） |
-| `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI base URL |
-| `OPENAI_MODELS` | — | 显式指定的 OpenAI 模型列表 |
-| `OPENAI_MODEL_PREFIXES` | `gpt-,o1,o3,o4,codex-,chatgpt-` | 启发式路由前缀 |
+| 变量                      | 默认值                                       | 说明                  |
+| ----------------------- | ----------------------------------------- | ------------------- |
+| `DEEPSEEK_API_KEY`      | —                                         | DeepSeek 上游密钥       |
+| `DEEPSEEK_BASE_URL`     | `https://api.deepseek.com/v1`             | DeepSeek base URL   |
+| `DEEPSEEK_MODELS`       | `deepseek-v4-pro,deepseek-v4-flash`       | 对外暴露的模型列表           |
+| `MIMO_API_KEY`          | —                                         | 小米 MiMo 上游密钥        |
+| `MIMO_BASE_URL`         | `https://token-plan-cn.xiaomimimo.com/v1` | MiMo base URL       |
+| `MIMO_MODELS`           | `mimo-v2.5-pro`                           | 对外暴露的模型列表（**必须小写**） |
+| `OPENAI_API_KEY`        | —                                         | OpenAI 上游密钥（可选）     |
+| `OPENAI_BASE_URL`       | `https://api.openai.com/v1`               | OpenAI base URL     |
+| `OPENAI_MODELS`         | —                                         | 显式指定的 OpenAI 模型列表   |
+| `OPENAI_MODEL_PREFIXES` | `gpt-,o1,o3,o4,codex-,chatgpt-`           | 启发式路由前缀             |
 
 ### 模型清单
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `MODEL_CATALOG_PATH` | — | 指向 `proxy-models.json` 的路径，会覆盖上述 `*_MODELS`。即 Codex 通过 `model_catalog_json` 读取的同一文件 |
+| 变量                   | 默认值 | 说明                                                                                  |
+| -------------------- | --- | ----------------------------------------------------------------------------------- |
+| `MODEL_CATALOG_PATH` | —   | 指向 `proxy-models.json` 的路径，会覆盖上述 `*_MODELS`。即 Codex 通过 `model_catalog_json` 读取的同一文件 |
 
 ### 调优
 
-| 变量 | 默认值 | 说明 |
-|---|---|---|
-| `PROXY_PORT` | `4000` | 监听端口 |
-| `DEFAULT_PROVIDER` | auto | 模型未知时的回落供应商 |
-| `LOG_LEVEL` | `info` | `silent` / `error` / `warn` / `info` / `debug` |
-| `ACCESS_LOG` | on | 设为 `0` 可关闭逐请求访问日志 |
-| `UPSTREAM_TIMEOUT_MS` | `120000` | 上游请求超时 |
-| `STORE_TTL_MS` | `3600000` | 响应存储条目 TTL |
-| `STORE_MAX` | `500` | 响应存储 LRU 容量 |
-| `GITHUB_TOKEN` | — | 可选；未设置时按需调用 `gh auth token` |
+| 变量                    | 默认值       | 说明                                             |
+| --------------------- | --------- | ---------------------------------------------- |
+| `PROXY_PORT`          | `4000`    | 监听端口                                           |
+| `DEFAULT_PROVIDER`    | auto      | 模型未知时的回落供应商                                    |
+| `LOG_LEVEL`           | `info`    | `silent` / `error` / `warn` / `info` / `debug` |
+| `ACCESS_LOG`          | on        | 设为 `0` 可关闭逐请求访问日志                              |
+| `UPSTREAM_TIMEOUT_MS` | `120000`  | 上游请求超时                                         |
+| `STORE_TTL_MS`        | `3600000` | 响应存储条目 TTL                                     |
+| `STORE_MAX`           | `500`     | 响应存储 LRU 容量                                    |
+| `GITHUB_TOKEN`        | —         | 可选；未设置时按需调用 `gh auth token`                    |
 
 ## 路由规则
 
@@ -164,25 +164,25 @@ requires_openai_auth = true
 
 Codex 发送 `none | minimal | low | medium | high | xhigh`。各上游接受的子集不同：
 
-| Codex effort | DeepSeek | MiMo | OpenAI |
-|---|---|---|---|
-| `none` | `thinking: {type: "disabled"}` | `thinking: {type: "disabled"}` | 字段移除 |
-| `minimal` | `reasoning_effort: "low"` | `reasoning_effort: "low"` | 透传 |
-| `low` / `medium` / `high` | 透传 | 透传 | 透传 |
-| `xhigh` | `reasoning_effort: "xhigh"` | 限制为 `high` | 限制为 `high` |
+| Codex effort              | DeepSeek                       | MiMo                           | OpenAI     |
+| ------------------------- | ------------------------------ | ------------------------------ | ---------- |
+| `none`                    | `thinking: {type: "disabled"}` | `thinking: {type: "disabled"}` | 字段移除       |
+| `minimal`                 | `reasoning_effort: "low"`      | `reasoning_effort: "low"`      | 透传         |
+| `low` / `medium` / `high` | 透传                             | 透传                             | 透传         |
+| `xhigh`                   | `reasoning_effort: "xhigh"`    | 限制为 `high`                     | 限制为 `high` |
 
 > **注意：** DeepSeek 会静默忽略 `enable_thinking: false`，本代理改用 `thinking: {type: "disabled"}`。
 
 ## 端点
 
-| 方法 | 路径 | 鉴权 | 说明 |
-|---|---|---|---|
-| `GET` | `/health` | 否 | 健康检查 |
-| `GET` | `/v1/models` | 是 | 合并后的模型列表 |
-| `POST` | `/v1/responses` | 是 | Codex CLI 主端点（Responses API） |
-| `POST` | `/v1/chat/completions` | 是 | 直接 Chat Completions 透传 |
-| `GET` | `/cop?url=...` | 是 | URL 抓取（Jina Reader / 原生 HTTP） |
-| `POST` | `/cop` | 是 | 自定义方法/请求头/请求体的 URL 抓取 |
+| 方法     | 路径                     | 鉴权 | 说明                            |
+| ------ | ---------------------- | -- | ----------------------------- |
+| `GET`  | `/health`              | 否  | 健康检查                          |
+| `GET`  | `/v1/models`           | 是  | 合并后的模型列表                      |
+| `POST` | `/v1/responses`        | 是  | Codex CLI 主端点（Responses API）  |
+| `POST` | `/v1/chat/completions` | 是  | 直接 Chat Completions 透传        |
+| `GET`  | `/cop?url=...`         | 是  | URL 抓取（Jina Reader / 原生 HTTP） |
+| `POST` | `/cop`                 | 是  | 自定义方法/请求头/请求体的 URL 抓取         |
 
 ## 冒烟测试
 
@@ -202,13 +202,11 @@ MODEL=mimo-v2.5-pro ./scripts/smoke.sh  # 测试不同模型
 
 1. 打开 CC Switch → **Codex** 选项卡 → **添加供应商**
 2. 填写供应商信息：
-
-   | 字段 | 值 |
-   |---|---|
-   | 名称 | `codex-bridge`（或你喜欢的标签） |
-   | API Key | `.env` 中的 `PROXY_AUTH_KEY` |
+   | 字段       | 值                          |
+   | -------- | -------------------------- |
+   | 名称       | `codex-bridge`（或你喜欢的标签）    |
+   | API Key  | `.env` 中的 `PROXY_AUTH_KEY` |
    | Base URL | `http://127.0.0.1:4000/v1` |
-
 3. 点击 **启用** —— CC Switch 会自动写入 `~/.codex/auth.json` 并更新 `config.toml`。
 
 ### 多供应商切换
@@ -250,19 +248,32 @@ cc-switch use codex-bridge
 
 ## 常见问题
 
-| 症状 | 原因 | 解决方案 |
-|---|---|---|
-| `EADDRINUSE :4000` | 端口被占用 | `lsof -ti:4000 \| xargs kill` 或在 `.env` 中更改 `PROXY_PORT` |
-| `401 Unauthorized` | 鉴权密钥不匹配 | 确认 `~/.codex/auth.json` 中的 `OPENAI_API_KEY` 与 `.env` 中的 `PROXY_AUTH_KEY` 一致 |
-| `--env-file: not recognized` | Node.js 版本 < 20 | 使用 `set -a && source .env && set +a && node proxy.mjs` |
-| 上游超时 | 供应商响应慢 | 在 `.env` 中增大 `UPSTREAM_TIMEOUT_MS`（默认 120 000 ms） |
-| 模型未找到 | 模型不在 `*_MODELS` 列表中 | 添加到 `DEEPSEEK_MODELS` / `MIMO_MODELS` / `OPENAI_MODELS`，或使用 `MODEL_CATALOG_PATH` |
+| 症状                           | 原因                  | 解决方案                                                                             |
+| ---------------------------- | ------------------- | -------------------------------------------------------------------------------- |
+| `EADDRINUSE :4000`           | 端口被占用               | `lsof -ti:4000 \| xargs kill` 或在 `.env` 中更改 `PROXY_PORT`                         |
+| `401 Unauthorized`           | 鉴权密钥不匹配             | 确认 `~/.codex/auth.json` 中的 `OPENAI_API_KEY` 与 `.env` 中的 `PROXY_AUTH_KEY` 一致      |
+| `--env-file: not recognized` | Node.js 版本 < 20     | 使用 `set -a && source .env && set +a && node proxy.mjs`                           |
+| 上游超时                         | 供应商响应慢              | 在 `.env` 中增大 `UPSTREAM_TIMEOUT_MS`（默认 120 000 ms）                                |
+| 模型未找到                        | 模型不在 `*_MODELS` 列表中 | 添加到 `DEEPSEEK_MODELS` / `MIMO_MODELS` / `OPENAI_MODELS`，或使用 `MODEL_CATALOG_PATH` |
 
 ## 环境要求
 
 - Node.js 18+
 - macOS / Linux / Windows
 - 至少一个上游 API 密钥（DeepSeek、MiMo 或 OpenAI）
+
+## 本 Fork 修复内容
+
+> Fork 自 [wujfeng712-ui/codex-bridge](https://github.com/wujfeng712-ui/codex-bridge)。
+
+- 🔴 **MiMo thinking + tool\_calls 不兼容** — 补全 `reasoning_content` 回放与安全网守卫
+- 🔴 **启动崩溃日志丢失** — `process.on` 移到 `log` 初始化之后
+- 🟠 **MiMo 多轮上下文丢失** — `previous_response_id` 链解析扩展至所有 OAI 兼容供应商
+- 🟠 **流式 content 被丢弃** — 移除 tool\_calls 分支误加的 `continue`
+- 🟠 **上游网络异常导致 500 崩溃** — 三处 fetch 添加 try-catch，返回 502
+- 🟡 **消息截断后仍超限** — 跳过前导 tool 消息 + 安全硬截断
+
+所有修改均在 `proxy.mjs` 中，配置与接口不变。`git merge upstream/main` 即可合并上游更新。
 
 ## 许可证
 

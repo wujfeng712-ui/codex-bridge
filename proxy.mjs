@@ -3,13 +3,6 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import { execSync } from "node:child_process";
 
-process.on("uncaughtException", (err) => {
-  log.error("[proxy] uncaught exception:", err.message);
-});
-process.on("unhandledRejection", (err) => {
-  log.error("[proxy] unhandled rejection:", err.message || err);
-});
-
 const PORT = process.env.PROXY_PORT || 4000;
 
 // === Logging ===
@@ -31,6 +24,15 @@ const log = {
   debug: (...a) => { if (LOG_LEVEL >= LOG_LEVELS.debug) console.log(...a); },
   access: (...a) => { if (ACCESS_LOG_ON) console.log(...a); },
 };
+
+process.on("uncaughtException", (err) => {
+  console.error("[proxy] uncaught exception:", err.message);
+  process.exit(1);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("[proxy] unhandled rejection:", err.message || err);
+  process.exit(1);
+});
 
 // === Inbound auth ===
 //
@@ -479,13 +481,13 @@ function maybeResolvePreviousResponseChain(body, targetProvider) {
 
   const previous = responseStore.get(body.previous_response_id);
   if (!previous) {
-    if (targetProvider === "deepseek") {
-      log.warn(`[proxy] previous_response_id ${body.previous_response_id} missing; DeepSeek request will continue without restored history`);
+    if (targetProvider === "deepseek" || targetProvider === "mimo") {
+      log.warn(`[proxy] previous_response_id ${body.previous_response_id} missing; ${targetProvider} request will continue without restored history`);
     }
     return;
   }
 
-  const needsLocalResolution = targetProvider === "deepseek" || previous.provider !== targetProvider;
+  const needsLocalResolution = !!OAI_COMPAT_PROVIDERS[targetProvider] || previous.provider !== targetProvider;
   if (!needsLocalResolution) return;
 
   const chainItems = resolveResponseChain(body.previous_response_id);
@@ -494,7 +496,7 @@ function maybeResolvePreviousResponseChain(body, targetProvider) {
   const currentInput = normalizeInputToArray(body.input);
   body.input = [...chainItems, ...currentInput];
   delete body.previous_response_id;
-  log.info(`[proxy] locally resolved previous_response_id across provider boundary -> ${targetProvider} (${chainItems.length} items prepended)`);
+  log.info(`[proxy] locally resolved previous_response_id for ${targetProvider} (${chainItems.length} items prepended)`);
 }
 
 // --- Shared message-list normalisation ---
@@ -663,12 +665,13 @@ function responsesRequestToChatCompletions(body, provider) {
 
   // Build a callId -> reasoning_content map from responseStore. We capture
   // upstream `delta.reasoning_content` on each turn and stash it on the stored
-  // entry; here we replay it so DeepSeek's thinking-mode tool-call round-trip
-  // doesn't 400 on a missing `reasoning_content`. Scanning all entries is fine
-  // because the store is hard-capped (STORE_MAX, default 500). Only build the
-  // index for DeepSeek — MiMo / OpenAI don't accept reasoning_content fields.
+  // entry; here we replay it so OAI-compatible providers (DeepSeek, MiMo)
+  // thinking-mode tool-call round-trip doesn't 400 on a missing
+  // `reasoning_content`. Scanning all entries is fine because the store is
+  // hard-capped (STORE_MAX, default 500). Only build the index for providers
+  // that require reasoning_content round-trip (DeepSeek, MiMo).
   const reasoningByCallId = new Map();
-  if (provider === "deepseek") {
+  if (provider === "deepseek" || provider === "mimo") {
     for (const entry of responseStore.values()) {
       if (!entry.reasoningContent) continue;
       for (const out of entry.output || []) {
@@ -757,7 +760,11 @@ function responsesRequestToChatCompletions(body, provider) {
   const MAX_MESSAGES = 55;
   let finalMessages = merged;
   if (merged.length > MAX_MESSAGES) {
-    const head = merged.slice(0, 2);
+    // Skip any leading tool messages so head contains meaningful context.
+    let headStart = 0;
+    while (headStart < merged.length && merged[headStart].role === "tool") headStart++;
+    const head = merged.slice(headStart, headStart + 2);
+
     let tail = merged.slice(-(MAX_MESSAGES - 3));
     while (tail.length > 0 && tail[0].role === "tool") tail.shift();
     finalMessages = [
@@ -774,6 +781,10 @@ function responsesRequestToChatCompletions(body, provider) {
   // After trim we may have left orphan tool messages — re-normalise to drop them.
   if (merged.length > MAX_MESSAGES) {
     finalMessages = normalizeMessages(finalMessages);
+    // Safety guard: hard-truncate if normalisation still leaves the list over the limit.
+    if (finalMessages.length > MAX_MESSAGES) {
+      finalMessages = finalMessages.slice(0, MAX_MESSAGES);
+    }
   }
 
   const req = {
@@ -812,30 +823,30 @@ function responsesRequestToChatCompletions(body, provider) {
   applyEffortTranslation(req, body.reasoning?.effort, provider);
   if (body.parallel_tool_calls != null) req.parallel_tool_calls = body.parallel_tool_calls;
 
-  // DeepSeek thinking-mode + tool-call round-trip safety net.
+  // OAI-compatible providers thinking-mode + tool-call round-trip safety net.
   //
-  // When DeepSeek runs in thinking mode (the default unless we send
-  // `thinking:{type:"disabled"}`), it requires the original `reasoning_content`
+  // When DeepSeek or MiMo runs in thinking mode (the default unless we send
+  // `thinking:{type:"disabled"}`), they require the original `reasoning_content`
   // to be sent back attached to any prior assistant tool_call message; otherwise
-  // it 400s with "The `reasoning_content` in the thinking mode must be passed
-  // back to the API.". Codex CLI does NOT round-trip `reasoning_content` through
-  // this proxy (we strip it from the upstream stream and Codex stores nothing
-  // we can replay), so any conversation that includes an assistant tool_call
-  // must run with thinking disabled — otherwise the very next turn dies.
+  // they 400 with missing reasoning_content errors. Codex CLI does NOT
+  // round-trip `reasoning_content` through this proxy (we strip it from the
+  // upstream stream and Codex stores nothing we can replay), so any conversation
+  // that includes an assistant tool_call must run with thinking disabled —
+  // otherwise the very next turn dies.
   //
   // We trigger this defensively whenever the request body contains an assistant
   // message with `tool_calls` and `req.thinking` isn't already disabled. This
   // also covers the case where the client sends `reasoning:{}` without an
-  // explicit effort (then applyEffortTranslation is a no-op and DeepSeek would
-  // default to thinking ON).
-  if (provider === "deepseek" && req.thinking?.type !== "disabled") {
+  // explicit effort (then applyEffortTranslation is a no-op and the provider
+  // would default to thinking ON).
+  if ((provider === "deepseek" || provider === "mimo") && req.thinking?.type !== "disabled") {
     const hasAssistantToolCalls = finalMessages.some(
       (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0 && !m.reasoning_content
     );
     if (hasAssistantToolCalls) {
       req.thinking = { type: "disabled" };
       delete req.reasoning_effort;
-      log.info("[proxy] deepseek: assistant tool_calls without reasoning_content -> forcing thinking:disabled");
+      log.info(`[proxy] ${provider}: assistant tool_calls without reasoning_content -> forcing thinking:disabled`);
     }
   }
 
@@ -1050,7 +1061,6 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
             completionSent = true;
             streamOutput = await sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, finishReason, parsed.usage, previousResponseId, metadata);
           }
-          continue;
         }
 
         if (typeof delta?.reasoning_content === "string") {
@@ -1508,20 +1518,32 @@ async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upst
 
   for (let loop = 0; loop <= MAX_FETCH_LOOPS; loop++) {
     const loopReq = { ...baseRequest, messages: loopMessages, stream: false };
-    const upstreamRes = await fetchWithTimeout(upstreamUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${upstreamKey}`,
-      },
-      body: JSON.stringify(loopReq),
-    }, UPSTREAM_TIMEOUT);
+    let upstreamRes = null;
+    let ccResponse = null;
+    try {
+      upstreamRes = await fetchWithTimeout(upstreamUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${upstreamKey}`,
+        },
+        body: JSON.stringify(loopReq),
+      }, UPSTREAM_TIMEOUT);
 
-    if (!upstreamRes.ok) {
-      return { ok: false, errorRes: upstreamRes };
+      if (!upstreamRes.ok) {
+        return { ok: false, errorRes: upstreamRes };
+      }
+
+      ccResponse = await upstreamRes.json();
+    } catch (err) {
+      log.error(`[proxy] ${tag}fetch to upstream failed (loop ${loop + 1}): ${err.message}`);
+      const errBody = JSON.stringify({ error: { message: `Upstream request failed: ${err.message}` } });
+      const syntheticRes = new Response(errBody, {
+        status: 502,
+        headers: { "content-type": "application/json" },
+      });
+      return { ok: false, errorRes: syntheticRes };
     }
-
-    const ccResponse = await upstreamRes.json();
     const msg = ccResponse.choices?.[0]?.message;
     const webFetchCalls = (msg?.tool_calls || []).filter((tc) => tc.function?.name === "web_fetch");
     const currentFetchUrls = webFetchCalls.map((tc) => {
@@ -1674,52 +1696,61 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     return;
   }
 
-  const upstreamRes = await fetchWithTimeout(upstreamUrl, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${upstreamKey}`,
-    },
-    body: JSON.stringify(chatReq),
-  });
+  try {
+    const upstreamRes = await fetchWithTimeout(upstreamUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${upstreamKey}`,
+      },
+      body: JSON.stringify(chatReq),
+    });
 
-  if (!upstreamRes.ok) {
-    await sendUpstreamError(upstreamRes, res);
-    return;
-  }
+    if (!upstreamRes.ok) {
+      await sendUpstreamError(upstreamRes, res);
+      return;
+    }
 
-  if (isStream) {
-    const { responseId: streamRespId, output: streamOutput, reasoningContent: streamReasoning } = await handleStreamingResponse(
-      req,
-      upstreamRes,
-      res,
-      body.model,
-      originalPreviousResponseId,
-      body.metadata
-    );
-    storeResponse(streamRespId, {
+    if (isStream) {
+      const { responseId: streamRespId, output: streamOutput, reasoningContent: streamReasoning } = await handleStreamingResponse(
+        req,
+        upstreamRes,
+        res,
+        body.model,
+        originalPreviousResponseId,
+        body.metadata
+      );
+      storeResponse(streamRespId, {
+        provider,
+        input: originalInput,
+        output: streamOutput,
+        previousResponseId: originalPreviousResponseId,
+        breakerFired: hardBreakerFired,
+        reasoningContent: streamReasoning || "",
+      });
+      return;
+    }
+
+    const ccResponse = await upstreamRes.json();
+    const responsesResponse = chatCompletionToResponse(ccResponse, body.model, originalPreviousResponseId, body.metadata);
+    const nonStreamReasoning = ccResponse.choices?.[0]?.message?.reasoning_content || "";
+    storeResponse(responsesResponse.id, {
       provider,
       input: originalInput,
-      output: streamOutput,
+      output: responsesResponse.output,
+      reasoningContent: nonStreamReasoning,
       previousResponseId: originalPreviousResponseId,
       breakerFired: hardBreakerFired,
-      reasoningContent: streamReasoning || "",
     });
-    return;
+    sendJson(res, 200, responsesResponse);
+  } catch (err) {
+    log.error(`[proxy] upstream fetch failed: ${err.message}`);
+    if (!res.headersSent) {
+      sendJson(res, 502, { error: { message: `Upstream request failed: ${err.message}` } });
+    } else {
+      res.end();
+    }
   }
-
-  const ccResponse = await upstreamRes.json();
-  const responsesResponse = chatCompletionToResponse(ccResponse, body.model, originalPreviousResponseId, body.metadata);
-  const nonStreamReasoning = ccResponse.choices?.[0]?.message?.reasoning_content || "";
-  storeResponse(responsesResponse.id, {
-    provider,
-    input: originalInput,
-    output: responsesResponse.output,
-    reasoningContent: nonStreamReasoning,
-    previousResponseId: originalPreviousResponseId,
-    breakerFired: hardBreakerFired,
-  });
-  sendJson(res, 200, responsesResponse);
 }
 
 async function handleOaiCompatChatCompletions(req, provider, body, res) {
@@ -1799,41 +1830,50 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
     return;
   }
 
-  const upstreamRes = await fetchWithTimeout(`${cfg.base}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${cfg.key}`,
-    },
-    body: JSON.stringify(body),
-  });
-
-  if (!upstreamRes.ok) {
-    await sendUpstreamError(upstreamRes, res);
-    return;
-  }
-
-  if (isStream) {
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      Connection: "keep-alive",
+  try {
+    const upstreamRes = await fetchWithTimeout(`${cfg.base}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${cfg.key}`,
+      },
+      body: JSON.stringify(body),
     });
-    const teardown = wireClientCancel(res, upstreamRes);
-    try {
-      for await (const chunk of upstreamRes.body) {
-        if (clientGone(res)) break;
-        await writeWithBackpressure(res, chunk);
-      }
-    } finally {
-      teardown();
-    }
-    res.end();
-    return;
-  }
 
-  const data = await upstreamRes.json();
-  sendJson(res, 200, data);
+    if (!upstreamRes.ok) {
+      await sendUpstreamError(upstreamRes, res);
+      return;
+    }
+
+    if (isStream) {
+      res.writeHead(200, {
+        "Content-Type": "text/event-stream",
+        "Cache-Control": "no-cache",
+        Connection: "keep-alive",
+      });
+      const teardown = wireClientCancel(res, upstreamRes);
+      try {
+        for await (const chunk of upstreamRes.body) {
+          if (clientGone(res)) break;
+          await writeWithBackpressure(res, chunk);
+        }
+      } finally {
+        teardown();
+      }
+      res.end();
+      return;
+    }
+
+    const data = await upstreamRes.json();
+    sendJson(res, 200, data);
+  } catch (err) {
+    log.error(`[proxy] chat/completions upstream fetch failed: ${err.message}`);
+    if (!res.headersSent) {
+      sendJson(res, 502, { error: { message: `Upstream request failed: ${err.message}` } });
+    } else {
+      res.end();
+    }
+  }
 }
 
 // --- HTTP server ---
