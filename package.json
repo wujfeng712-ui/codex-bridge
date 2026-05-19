@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node --env-file=.env proxy.mjs",
+    "test": "node scripts/reasoning-replay.test.mjs",
     "smoke": "./scripts/smoke.sh"
   },
   "keywords": [

@@ -103,6 +103,7 @@ const OPENAI_MODELS = parseCsv(process.env.OPENAI_MODELS || "");
 const OPENAI_MODEL_PREFIXES = parseCsv(process.env.OPENAI_MODEL_PREFIXES || "gpt-,o1,o3,o4,codex-,chatgpt-");
 
 const DEFAULT_PROVIDER = (process.env.DEFAULT_PROVIDER || "").trim().toLowerCase();
+const TEST_MODE = process.env.CODEX_BRIDGE_TEST === "1";
 
 // GitHub token is fetched lazily on first github.com web_fetch call so we don't
 // pay the gh-CLI startup cost during proxy boot. Sentinel "unresolved" means
@@ -115,7 +116,7 @@ function getGithubToken() {
   return _githubToken;
 }
 
-if (!DEEPSEEK_KEY && !OPENAI_KEY && !MIMO_KEY) {
+if (!TEST_MODE && !DEEPSEEK_KEY && !OPENAI_KEY && !MIMO_KEY) {
   console.error("At least one upstream provider key is required: set DEEPSEEK_API_KEY, MIMO_API_KEY, and/or OPENAI_API_KEY");
   process.exit(1);
 }
@@ -406,6 +407,37 @@ function touchResponse(id) {
   return entry;
 }
 
+function buildReasoningIndex(output, reasoningContent) {
+  const byCallId = new Map();
+  const byItemId = new Map();
+  if (!reasoningContent) return { byCallId, byItemId };
+  for (const out of output || []) {
+    if (out?.type !== "function_call") continue;
+    if (out.call_id) byCallId.set(out.call_id, reasoningContent);
+    if (out.id) byItemId.set(out.id, reasoningContent);
+  }
+  return { byCallId, byItemId };
+}
+
+function getResponseChainEntries(previousResponseId) {
+  const chain = [];
+  let currentId = previousResponseId;
+  const visited = new Set();
+
+  while (currentId && !visited.has(currentId)) {
+    visited.add(currentId);
+    const stored = touchResponse(currentId);
+    if (!stored) {
+      log.warn(`[proxy] previous_response_id ${currentId} not found in store`);
+      break;
+    }
+    chain.unshift({ id: currentId, stored });
+    currentId = stored.previousResponseId;
+  }
+
+  return chain;
+}
+
 function storeResponse(id, data) {
   if (!id) return;
 
@@ -436,32 +468,18 @@ function storeResponse(id, data) {
     }
   }
 
-  responseStore.set(id, { ...data, storedAt: Date.now(), consecutiveToolCalls });
+  const reasoningIndex = buildReasoningIndex(data.output, data.reasoningContent);
+  responseStore.set(id, { ...data, ...reasoningIndex, storedAt: Date.now(), consecutiveToolCalls });
   log.info(
     `[proxy] stored response ${id} (provider=${data.provider || "unknown"}, store size: ${responseStore.size}${consecutiveToolCalls > 0 ? `, consecutive_tc: ${consecutiveToolCalls}` : ""})`
   );
 }
 
 function resolveResponseChain(previousResponseId) {
-  const chain = [];
-  let currentId = previousResponseId;
-  const visited = new Set();
-
-  while (currentId && !visited.has(currentId)) {
-    visited.add(currentId);
-    const stored = touchResponse(currentId);
-    if (!stored) {
-      log.warn(`[proxy] previous_response_id ${currentId} not found in store`);
-      break;
-    }
-    chain.unshift(stored);
-    currentId = stored.previousResponseId;
-  }
-
   const items = [];
-  for (const entry of chain) {
-    if (Array.isArray(entry.input)) items.push(...entry.input);
-    if (Array.isArray(entry.output)) items.push(...entry.output);
+  for (const { stored } of getResponseChainEntries(previousResponseId)) {
+    if (Array.isArray(stored.input)) items.push(...stored.input);
+    if (Array.isArray(stored.output)) items.push(...stored.output);
   }
   return items;
 }
@@ -477,6 +495,7 @@ function normalizeInputToArray(input) {
 function maybeResolvePreviousResponseChain(body, targetProvider) {
   if (!body.previous_response_id) return;
 
+  const originalPreviousResponseId = body.previous_response_id;
   const previous = responseStore.get(body.previous_response_id);
   if (!previous) {
     if (targetProvider === "deepseek") {
@@ -493,6 +512,7 @@ function maybeResolvePreviousResponseChain(body, targetProvider) {
 
   const currentInput = normalizeInputToArray(body.input);
   body.input = [...chainItems, ...currentInput];
+  body._resolved_previous_response_id = originalPreviousResponseId;
   delete body.previous_response_id;
   log.info(`[proxy] locally resolved previous_response_id across provider boundary -> ${targetProvider} (${chainItems.length} items prepended)`);
 }
@@ -651,8 +671,58 @@ function applyEffortTranslation(req, effort, provider) {
   req.reasoning_effort = e;
 }
 
+function buildReasoningReplayIndex(previousResponseId) {
+  const byCallId = new Map();
+  const byItemId = new Map();
+
+  const addEntry = (entry, source) => {
+    if (!entry.byCallId && !entry.byItemId && entry.reasoningContent) {
+      const index = buildReasoningIndex(entry.output, entry.reasoningContent);
+      entry = { ...entry, ...index };
+    }
+    for (const [callId, reasoning] of entry.byCallId || []) {
+      if (!byCallId.has(callId)) byCallId.set(callId, { reasoning, source });
+    }
+    for (const [itemId, reasoning] of entry.byItemId || []) {
+      if (!byItemId.has(itemId)) byItemId.set(itemId, { reasoning, source });
+    }
+  };
+
+  if (previousResponseId) {
+    for (const { id, stored } of getResponseChainEntries(previousResponseId).reverse()) {
+      addEntry(stored, `chain:${id}`);
+    }
+  }
+
+  for (const [id, entry] of [...responseStore.entries()].reverse()) {
+    addEntry(entry, `store:${id}`);
+  }
+
+  return { byCallId, byItemId };
+}
+
+function applyDeepSeekToolRoundTripSafety(req, context = "request") {
+  if (req.thinking?.type === "disabled") return false;
+  const assistantToolMessages = (req.messages || []).filter(
+    (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0
+  );
+  const missingReasoningCount = assistantToolMessages.filter((m) => {
+    if (typeof m.reasoning_content !== "string") return true;
+    return m.reasoning_content.trim().length === 0;
+  }).length;
+  if (missingReasoningCount === 0) return false;
+
+  req.thinking = { type: "disabled" };
+  delete req.reasoning_effort;
+  log.warn(
+    `[proxy] deepseek safety-net (${context}): ${missingReasoningCount}/${assistantToolMessages.length} assistant tool_call message(s) missing reasoning_content -> forcing thinking:disabled`
+  );
+  return true;
+}
+
 function responsesRequestToChatCompletions(body, provider) {
   const messages = [];
+  const previousResponseIdForReplay = body.previous_response_id || body._resolved_previous_response_id || null;
 
   if (body.instructions) {
     messages.push({
@@ -661,23 +731,7 @@ function responsesRequestToChatCompletions(body, provider) {
     });
   }
 
-  // Build a callId -> reasoning_content map from responseStore. We capture
-  // upstream `delta.reasoning_content` on each turn and stash it on the stored
-  // entry; here we replay it so DeepSeek's thinking-mode tool-call round-trip
-  // doesn't 400 on a missing `reasoning_content`. Scanning all entries is fine
-  // because the store is hard-capped (STORE_MAX, default 500). Only build the
-  // index for DeepSeek — MiMo / OpenAI don't accept reasoning_content fields.
-  const reasoningByCallId = new Map();
-  if (provider === "deepseek") {
-    for (const entry of responseStore.values()) {
-      if (!entry.reasoningContent) continue;
-      for (const out of entry.output || []) {
-        if (out.type === "function_call" && out.call_id) {
-          reasoningByCallId.set(out.call_id, entry.reasoningContent);
-        }
-      }
-    }
-  }
+  const reasoningReplay = provider === "deepseek" ? buildReasoningReplayIndex(previousResponseIdForReplay) : null;
 
   if (typeof body.input === "string") {
     messages.push({ role: "user", content: body.input });
@@ -689,8 +743,12 @@ function responsesRequestToChatCompletions(body, provider) {
       // Attach reasoning if any of the calls in this batch has one cached.
       // (DeepSeek emits one reasoning per response, shared by all tool_calls.)
       for (const tc of pendingToolCalls) {
-        const r = reasoningByCallId.get(tc.id);
-        if (r) { msg.reasoning_content = r; break; }
+        const hit = reasoningReplay?.byCallId.get(tc.id) || reasoningReplay?.byItemId.get(tc.id);
+        if (hit?.reasoning) {
+          msg.reasoning_content = hit.reasoning;
+          log.debug(`[proxy] deepseek reasoning replay hit (${hit.source}, call_id=${tc.id})`);
+          break;
+        }
       }
       messages.push(msg);
       pendingToolCalls = [];
@@ -828,16 +886,7 @@ function responsesRequestToChatCompletions(body, provider) {
   // also covers the case where the client sends `reasoning:{}` without an
   // explicit effort (then applyEffortTranslation is a no-op and DeepSeek would
   // default to thinking ON).
-  if (provider === "deepseek" && req.thinking?.type !== "disabled") {
-    const hasAssistantToolCalls = finalMessages.some(
-      (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0 && !m.reasoning_content
-    );
-    if (hasAssistantToolCalls) {
-      req.thinking = { type: "disabled" };
-      delete req.reasoning_effort;
-      log.info("[proxy] deepseek: assistant tool_calls without reasoning_content -> forcing thinking:disabled");
-    }
-  }
+  if (provider === "deepseek") applyDeepSeekToolRoundTripSafety(req, "responses");
 
   return req;
 }
@@ -1498,7 +1547,7 @@ async function forwardOpenAIChatCompletions(req, body, res) {
 //
 // `prefix` is just for log lines so callers can distinguish responses-path vs
 // chat-completions-path output.
-async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upstreamKey, prefix = "" }) {
+async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upstreamKey, provider = "", prefix = "" }) {
   let loopMessages = [...initialMessages];
   let finalCcResponse = null;
   let fetchLoopCount = 0;
@@ -1508,6 +1557,7 @@ async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upst
 
   for (let loop = 0; loop <= MAX_FETCH_LOOPS; loop++) {
     const loopReq = { ...baseRequest, messages: loopMessages, stream: false };
+    if (provider === "deepseek") applyDeepSeekToolRoundTripSafety(loopReq, `${tag || "responses"}web_fetch loop ${loop + 1}`);
     const upstreamRes = await fetchWithTimeout(upstreamUrl, {
       method: "POST",
       headers: {
@@ -1568,11 +1618,11 @@ async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upst
       return { role: "tool", tool_call_id: tc.id, content };
     }));
 
-    loopMessages = [
-      ...loopMessages,
-      { role: "assistant", content: null, tool_calls: webFetchCalls },
-      ...results,
-    ];
+    const assistantMessage = { role: "assistant", content: null, tool_calls: webFetchCalls };
+    if (typeof msg?.reasoning_content === "string" && msg.reasoning_content.trim().length > 0) {
+      assistantMessage.reasoning_content = msg.reasoning_content;
+    }
+    loopMessages = [...loopMessages, assistantMessage, ...results];
   }
 
   if (fetchLoopCount > 0) {
@@ -1653,6 +1703,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
       initialMessages: chatReq.messages,
       upstreamUrl,
       upstreamKey,
+      provider,
       prefix: "",
     });
     if (!result.ok) {
@@ -1764,6 +1815,7 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
       initialMessages: body.messages,
       upstreamUrl: `${cfg.base}/chat/completions`,
       upstreamKey: cfg.key,
+      provider,
       prefix: "cc",
     });
     if (!result.ok) {
@@ -1838,7 +1890,7 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
 
 // --- HTTP server ---
 
-const server = http.createServer(async (req, res) => {
+const server = TEST_MODE ? null : http.createServer(async (req, res) => {
   // Lightweight access log so we can see what cc-switch / Codex actually sends.
   // Toggle off by setting ACCESS_LOG=0 in .env.
   if (process.env.ACCESS_LOG !== "0") {
@@ -2080,6 +2132,7 @@ const server = http.createServer(async (req, res) => {
   sendJson(res, 404, { error: "Not found. Use POST /v1/responses" });
 });
 
+if (server) {
 server.timeout = 0;
 server.keepAliveTimeout = 300000;
 server.headersTimeout = 300000;
@@ -2104,3 +2157,11 @@ server.listen(PORT, () => {
     }
   }
 });
+}
+
+export const __test = TEST_MODE ? {
+  responseStore,
+  storeResponse,
+  responsesRequestToChatCompletions,
+  applyDeepSeekToolRoundTripSafety,
+} : {};
