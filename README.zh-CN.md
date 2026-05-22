@@ -26,7 +26,7 @@ codex-bridge 在两者之间双向转换 —— 包含流式 SSE、工具调用�
 
 ## 特性
 
-- **多供应商路由** —— 根据模型名自动选择 DeepSeek / MiMo / OpenAI
+- **多供应商路由** —— 根据模型名自动选择 DeepSeek / MiMo / MiniMax / OpenAI / 自定义供应商
 - **双向协议转换** —— Responses API ↔ Chat Completions，含流式 SSE 桥接
 - **按供应商翻译思考强度** —— 将 Codex 的 `none | minimal | low | medium | high | xhigh` 映射到各上游的原生格式
 - **思考模式 + 工具调用回合** —— 缓存并回放 `reasoning_content`，使 DeepSeek 的思考模式跨多轮工具调用保持一致
@@ -51,6 +51,14 @@ cp env.example .env
 ```bash
 PROXY_AUTH_KEY=sk-proxy-local-$(openssl rand -hex 24)   # 自动生成一个
 DEEPSEEK_API_KEY=sk-...                                  # 来自 platform.deepseek.com
+```
+
+```bash
+# 或使用自定义 OpenAI 兼容供应商：
+# CUSTOM_BASE_URL=https://your-provider.example.com/v1
+# CUSTOM_API_KEY=your-key
+# CUSTOM_MODELS=model-a,model-b
+# DEFAULT_PROVIDER=custom
 ```
 
 ### 2. 启动代理
@@ -98,10 +106,10 @@ requires_openai_auth = true
                    ┌───────────────────────┼────────────────────────┐
                    │                       │                        │
                    ▼                       ▼                        ▼
-          ┌────────────────┐      ┌────────────────┐       ┌──────────────┐
-          │   DeepSeek V4  │      │   小米 MiMo    │       │    OpenAI    │
-          │ Chat Complet.  │      │ Chat Complet.  │       │  Responses   │
-          └────────────────┘      └────────────────┘       └──────────────┘
+          ┌────────────────┐      ┌────────────────┐       ┌──────────────┐       ┌────────────────┐
+          │   DeepSeek V4  │      │   小米 MiMo    │       │    OpenAI    │       │    自定义      │
+          │ Chat Complet.  │      │ Chat Complet.  │       │  Responses   │       │ Chat Complet.  │
+          └────────────────┘      └────────────────┘       └──────────────┘       └────────────────┘
 ```
 
 ## 配置
@@ -113,7 +121,7 @@ requires_openai_auth = true
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `PROXY_AUTH_KEY` | — | 单一入站密钥（不锁定供应商） |
-| `PROXY_KEYS` | — | 多密钥表：`<key>:<provider>,...`，provider ∈ `deepseek` / `mimo` / `openai` / `*` |
+| `PROXY_KEYS` | — | 多密钥表：`<key>:<provider>,...`，provider ∈ `deepseek` / `mimo` / `minimax` / `openai` / `custom` / `*` |
 
 两者均空 = 关闭鉴权（不推荐）。
 
@@ -131,6 +139,9 @@ requires_openai_auth = true
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI base URL |
 | `OPENAI_MODELS` | — | 显式指定的 OpenAI 模型列表 |
 | `OPENAI_MODEL_PREFIXES` | `gpt-,o1,o3,o4,codex-,chatgpt-` | 启发式路由前缀 |
+| `CUSTOM_API_KEY` | — | 自定义供应商上游密钥（可选） |
+| `CUSTOM_BASE_URL` | — | 自定义供应商 base URL（设置 `CUSTOM_API_KEY` 时**必须**填写） |
+| `CUSTOM_MODELS` | — | 自定义供应商的模型列表（逗号分隔） |
 
 ### 模型清单
 
@@ -143,7 +154,7 @@ requires_openai_auth = true
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `PROXY_PORT` | `4000` | 监听端口 |
-| `DEFAULT_PROVIDER` | auto | 模型未知时的回落供应商 |
+| `DEFAULT_PROVIDER` | auto | 模型未知时的回落供应商（`deepseek` / `mimo` / `minimax` / `openai` / `custom` / `auto`） |
 | `LOG_LEVEL` | `info` | `silent` / `error` / `warn` / `info` / `debug` |
 | `ACCESS_LOG` | on | 设为 `0` 可关闭逐请求访问日志 |
 | `UPSTREAM_TIMEOUT_MS` | `120000` | 上游请求超时 |
@@ -155,10 +166,10 @@ requires_openai_auth = true
 
 每个请求按以下优先级根据模型名进行路由：
 
-1. **精确匹配** —— 模型出现在 `DEEPSEEK_MODELS` / `MIMO_MODELS` / `OPENAI_MODELS`
+1. **精确匹配** —— 模型出现在 `DEEPSEEK_MODELS` / `MIMO_MODELS` / `OPENAI_MODELS` / `CUSTOM_MODELS`
 2. **前缀启发** —— 以 `OPENAI_MODEL_PREFIXES` 中任一项开头 → OpenAI
-3. **名称提示** —— 包含 `deepseek` 或 `mimo` → 对应供应商
-4. **回落** —— `DEFAULT_PROVIDER`，再退回到第一个已配置密钥的供应商
+3. **名称提示** —— 包含 `deepseek` / `mimo` / `minimax` → 对应供应商
+4. **回落** —— `DEFAULT_PROVIDER`（`deepseek` / `mimo` / `minimax` / `openai` / `custom` / `auto`），再退回到第一个已配置密钥的供应商
 
 ## 思考强度翻译
 
@@ -247,6 +258,29 @@ cc-switch use codex-bridge
   ```
 - **多密钥锁定供应商** —— 为每个入站密钥指定固定供应商，便于多配置场景。`PROXY_KEYS` 格式参见 `env.example`。
 - **模型清单单一来源** —— 将 `MODEL_CATALOG_PATH` 指向 Codex 使用的同一份 JSON（`config.toml` 中的 `model_catalog_json`），自动保持模型列表同步。
+
+## 开机自启（Windows）
+
+将 codex-bridge 注册为计划任务，开机自动启动：
+
+```powershell
+# 以管理员身份运行
+powershell -ExecutionPolicy Bypass -File .\register-startup.ps1
+```
+
+注册后创建名为 `codex-bridge` 的任务，特性：
+- 开机自动启动（无需登录）
+- 崩溃后自动重启（最多 3 次，间隔 1 分钟）
+- 自动读取 `.env` 配置
+
+**管理任务：**
+
+| 操作 | 命令 |
+|---|---|
+| 启动 | `schtasks /Run /TN "codex-bridge"` |
+| 停止 | `schtasks /End /TN "codex-bridge"` |
+| 状态 | `schtasks /Query /TN "codex-bridge"` |
+| 卸载 | `powershell -ExecutionPolicy Bypass -File .\unregister-startup.ps1` |
 
 ## 常见问题
 

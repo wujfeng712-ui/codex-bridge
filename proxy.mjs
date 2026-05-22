@@ -56,7 +56,7 @@ const PROXY_KEYS_RAW = (process.env.PROXY_KEYS || "").trim();
 
 // Map<key, provider | "*">
 const PROXY_KEY_TABLE = new Map();
-const VALID_LOCK_PROVIDERS = new Set(["deepseek", "mimo", "openai", "*"]);
+const VALID_LOCK_PROVIDERS = new Set(["deepseek", "mimo", "minimax", "openai", "custom", "*"]);
 
 function loadProxyKeyTable() {
   for (const entry of parseCsv(PROXY_KEYS_RAW)) {
@@ -72,7 +72,7 @@ function loadProxyKeyTable() {
       continue;
     }
     if (!VALID_LOCK_PROVIDERS.has(provider)) {
-      log.warn(`[proxy] PROXY_KEYS entry has unknown provider "${provider}" (allowed: deepseek, mimo, openai, *) — ignored`);
+      log.warn(`[proxy] PROXY_KEYS entry has unknown provider "${provider}" (allowed: deepseek, mimo, minimax, openai, custom, *) — ignored`);
       continue;
     }
     if (PROXY_KEY_TABLE.has(key)) {
@@ -96,6 +96,18 @@ const MIMO_BASE = process.env.MIMO_BASE_URL || "https://token-plan-cn.xiaomimimo
 const MIMO_KEY = process.env.MIMO_API_KEY || "";
 const MIMO_MODELS = parseCsv(process.env.MIMO_MODELS || "mimo-v2.5-pro");
 
+const MINIMAX_BASE = process.env.MINIMAX_BASE_URL || "https://api.minimaxi.com/v1";
+const MINIMAX_KEY = process.env.MINIMAX_API_KEY || "";
+const MINIMAX_MODELS = parseCsv(process.env.MINIMAX_MODELS || "minimax-m2.7");
+
+const CUSTOM_BASE = process.env.CUSTOM_BASE_URL || "";
+const CUSTOM_KEY = process.env.CUSTOM_API_KEY || "";
+const CUSTOM_MODELS = parseCsv(process.env.CUSTOM_MODELS || "");
+if (CUSTOM_KEY && !CUSTOM_BASE) {
+  console.error("CUSTOM_API_KEY is set but CUSTOM_BASE_URL is missing. Set CUSTOM_BASE_URL to your provider's API base (e.g. https://your-provider.example.com/v1)");
+  process.exit(1);
+}
+
 const OPENAI_BASE = process.env.OPENAI_BASE_URL || "https://api.openai.com/v1";
 const OPENAI_KEY = process.env.OPENAI_API_KEY || "";
 // Default empty — OpenAI is opt-in, set OPENAI_MODELS or OPENAI_API_KEY explicitly to enable.
@@ -115,8 +127,8 @@ function getGithubToken() {
   return _githubToken;
 }
 
-if (!DEEPSEEK_KEY && !OPENAI_KEY && !MIMO_KEY) {
-  console.error("At least one upstream provider key is required: set DEEPSEEK_API_KEY, MIMO_API_KEY, and/or OPENAI_API_KEY");
+if (!DEEPSEEK_KEY && !OPENAI_KEY && !MIMO_KEY && !MINIMAX_KEY && !CUSTOM_KEY) {
+  console.error("At least one upstream provider key is required: set DEEPSEEK_API_KEY, MIMO_API_KEY, MINIMAX_API_KEY, CUSTOM_API_KEY, and/or OPENAI_API_KEY");
   process.exit(1);
 }
 
@@ -130,7 +142,7 @@ const MODEL_CATALOG_PATH = (process.env.MODEL_CATALOG_PATH || "").trim();
 function loadCatalogModels(path) {
   try {
     const raw = JSON.parse(fs.readFileSync(path, "utf-8"));
-    const out = { deepseek: [], mimo: [], openai: [] };
+    const out = { deepseek: [], mimo: [], openai: [], minimax: [], custom: [] };
     for (const m of raw.models || []) {
       if (!m?.slug) continue;
       let p = (m.provider || "").toLowerCase();
@@ -138,11 +150,12 @@ function loadCatalogModels(path) {
         const s = m.slug.toLowerCase();
         if (s.startsWith("deepseek")) p = "deepseek";
         else if (s.startsWith("mimo") || s.startsWith("xiaomi")) p = "mimo";
+        else if (s.startsWith("minimax")) p = "minimax";
         else if (s.startsWith("gpt-") || s.startsWith("o1") || s.startsWith("o3") || s.startsWith("o4") || s.startsWith("codex-") || s.startsWith("chatgpt-")) p = "openai";
       }
       if (out[p]) out[p].push(m.slug);
     }
-    console.log(`[codex-bridge] model_catalog: loaded ${path} (deepseek=${out.deepseek.length}, mimo=${out.mimo.length}, openai=${out.openai.length})`);
+    console.log(`[codex-bridge] model_catalog: loaded ${path} (deepseek=${out.deepseek.length}, mimo=${out.mimo.length}, minimax=${out.minimax.length}, openai=${out.openai.length}, custom=${out.custom.length})`);
     return out;
   } catch (err) {
     console.warn(`[codex-bridge] model_catalog: ${path} unreadable (${err.message}), falling back to env lists`);
@@ -153,7 +166,9 @@ const CATALOG = MODEL_CATALOG_PATH ? loadCatalogModels(MODEL_CATALOG_PATH) : nul
 if (CATALOG) {
   if (CATALOG.deepseek.length) DEEPSEEK_MODELS.splice(0, DEEPSEEK_MODELS.length, ...CATALOG.deepseek);
   if (CATALOG.mimo.length) MIMO_MODELS.splice(0, MIMO_MODELS.length, ...CATALOG.mimo);
+  if (CATALOG.minimax.length) MINIMAX_MODELS.splice(0, MINIMAX_MODELS.length, ...CATALOG.minimax);
   if (CATALOG.openai.length) OPENAI_MODELS.splice(0, OPENAI_MODELS.length, ...CATALOG.openai);
+  if (CATALOG.custom.length) CUSTOM_MODELS.splice(0, CUSTOM_MODELS.length, ...CATALOG.custom);
 }
 
 // OpenAI-compatible Chat Completions upstreams that share the DeepSeek adapter pipeline
@@ -162,6 +177,8 @@ if (CATALOG) {
 const OAI_COMPAT_PROVIDERS = {
   deepseek: { base: DEEPSEEK_BASE, key: DEEPSEEK_KEY, models: DEEPSEEK_MODELS, defaultModel: DEEPSEEK_MODELS[0] || "deepseek-v4-pro", envKey: "DEEPSEEK_API_KEY" },
   mimo:     { base: MIMO_BASE,     key: MIMO_KEY,     models: MIMO_MODELS,     defaultModel: MIMO_MODELS[0]     || "mimo-v2.5-pro",   envKey: "MIMO_API_KEY"     },
+  minimax:  { base: MINIMAX_BASE,  key: MINIMAX_KEY,  models: MINIMAX_MODELS,  defaultModel: MINIMAX_MODELS[0]  || "minimax-m2.7",    envKey: "MINIMAX_API_KEY"  },
+  custom:   { base: CUSTOM_BASE,   key: CUSTOM_KEY,   models: CUSTOM_MODELS,   defaultModel: CUSTOM_MODELS[0]   || "custom-default",  envKey: "CUSTOM_API_KEY"   },
 };
 
 const enabledProviders = new Set();
@@ -376,6 +393,7 @@ function getFallbackProvider() {
 const OAI_COMPAT_NAME_HINTS = [
   { provider: "deepseek", tokens: ["deepseek"] },
   { provider: "mimo",     tokens: ["mimo", "xiaomi"] },
+  { provider: "minimax",  tokens: ["minimax"] },
 ];
 
 function resolveProviderForModel(model) {
@@ -640,6 +658,10 @@ function applyEffortTranslation(req, effort, provider) {
     req.thinking = { type: "disabled" };
     return;
   }
+  if (provider === "minimax") {
+    // MiniMax doesn't support reasoning_effort parameter, skip
+    return;
+  }
   if (e === "minimal") {
     req.reasoning_effort = "low";
     return;
@@ -648,7 +670,9 @@ function applyEffortTranslation(req, effort, provider) {
     req.reasoning_effort = "high";
     return;
   }
-  req.reasoning_effort = e;
+  if (provider === "deepseek") {
+    req.reasoning_effort = e;
+  }
 }
 
 function responsesRequestToChatCompletions(body, provider) {
@@ -1614,11 +1638,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
   }
 
   const chatReq = responsesRequestToChatCompletions(body, provider);
-  // Honour the model the client asked for if it belongs to this provider; otherwise fall back to the
-  // provider's first configured model. (Codex usually sends the configured `model` field already.)
-  const requested = normalizeModelId(chatReq.model);
-  const isProviderModel = cfg.models.some((m) => normalizeModelId(m) === requested);
-  chatReq.model = isProviderModel ? chatReq.model : cfg.defaultModel;
+  // Pass through the model name as-is — Codex decides which model to use.
   const isStream = chatReq.stream;
 
   const upstreamUrl = `${cfg.base}/chat/completions`;
@@ -1729,9 +1749,6 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
     return;
   }
 
-  const requested = normalizeModelId(body.model);
-  const isProviderModel = body.model && cfg.models.some((m) => normalizeModelId(m) === requested);
-  body.model = isProviderModel ? body.model : cfg.defaultModel;
   const isStream = body.stream || false;
 
   const validated = normalizeMessages(body.messages || [], { coerceStrings: true });
@@ -2102,5 +2119,8 @@ server.listen(PORT, () => {
       const lockLabel = lock === "*" ? "any provider" : `locked to ${lock}`;
       console.log(`[codex-bridge]           ${key.slice(0, 16)}… (${key.length} chars) — ${lockLabel}`);
     }
+  }
+  if (CUSTOM_KEY) {
+    console.log(`[codex-bridge] Custom  : ${CUSTOM_BASE || "(CUSTOM_BASE_URL not set)"} | models=${CUSTOM_MODELS.join(", ") || "(none)"} | DEFAULT_PROVIDER=${DEFAULT_PROVIDER || "(not set)"}`);
   }
 });

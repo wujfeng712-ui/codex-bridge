@@ -27,7 +27,7 @@ codex-bridge translates between them in both directions — streaming SSE, tool 
 
 ## Features
 
-- **Multi-provider routing** — DeepSeek / MiMo / OpenAI, auto-selected by model name
+- **Multi-provider routing** — DeepSeek / MiMo / MiniMax / OpenAI / Custom, auto-selected by model name
 - **Bi-directional protocol translation** — Responses API ↔ Chat Completions with streaming SSE bridge
 - **Per-provider reasoning effort translation** — Codex's `none | minimal | low | medium | high | xhigh` mapped to each upstream's native format
 - **Thinking-mode tool-call round-trip** — caches `reasoning_content` and replays it so DeepSeek's thinking mode survives multi-turn tool calls
@@ -52,6 +52,15 @@ Edit `.env` — at minimum:
 ```bash
 PROXY_AUTH_KEY=sk-proxy-local-$(openssl rand -hex 24)   # generate one
 DEEPSEEK_API_KEY=sk-...                                  # from platform.deepseek.com
+```
+
+Or use a custom OpenAI-compatible provider:
+
+```bash
+# CUSTOM_BASE_URL=https://your-provider.example.com/v1
+# CUSTOM_API_KEY=your-key
+# CUSTOM_MODELS=model-a,model-b
+# DEFAULT_PROVIDER=custom
 ```
 
 ### 2. Start the proxy
@@ -96,13 +105,13 @@ Run `codex` — done.
 │             │  Authorization:     │    :4000     │
 └─────────────┘  Bearer <key>       └──────┬───────┘
                                            │  model-based routing
-                   ┌───────────────────────┼────────────────────────┐
-                   │                       │                        │
-                   ▼                       ▼                        ▼
-          ┌────────────────┐      ┌────────────────┐       ┌──────────────┐
-          │   DeepSeek V4  │      │  Xiaomi MiMo   │       │    OpenAI    │
-          │ Chat Complet.  │      │ Chat Complet.  │       │  Responses   │
-          └────────────────┘      └────────────────┘       └──────────────┘
+                   ┌───────────────────────┼────────────────────────┬───────────────────────┐
+                   │                       │                        │                       │
+                   ▼                       ▼                        ▼                       ▼
+          ┌────────────────┐      ┌────────────────┐       ┌──────────────┐       ┌────────────────┐
+          │   DeepSeek V4  │      │  Xiaomi MiMo   │       │    OpenAI    │       │    Custom      │
+          │ Chat Complet.  │      │ Chat Complet.  │       │  Responses   │       │ Chat Complet.  │
+          └────────────────┘      └────────────────┘       └──────────────┘       └────────────────┘
 ```
 
 ## Configuration
@@ -114,7 +123,7 @@ All settings via environment variables (see `env.example` for full documentation
 | Variable | Default | Description |
 |---|---|---|
 | `PROXY_AUTH_KEY` | — | Single inbound key (no provider lock) |
-| `PROXY_KEYS` | — | Multi-key table: `<key>:<provider>,...` where provider ∈ `deepseek`/`mimo`/`openai`/`*` |
+| `PROXY_KEYS` | — | Multi-key table: `<key>:<provider>,...` where provider ∈ `deepseek`/`mimo`/`minimax`/`openai`/`custom`/`*` |
 
 Both empty = auth disabled (not recommended).
 
@@ -132,6 +141,9 @@ Both empty = auth disabled (not recommended).
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI base URL |
 | `OPENAI_MODELS` | — | Explicit OpenAI model list |
 | `OPENAI_MODEL_PREFIXES` | `gpt-,o1,o3,o4,codex-,chatgpt-` | Heuristic routing prefixes |
+| `CUSTOM_API_KEY` | — | Custom provider upstream key (opt-in) |
+| `CUSTOM_BASE_URL` | — | Custom provider base URL (**required** if `CUSTOM_API_KEY` is set) |
+| `CUSTOM_MODELS` | — | Comma-separated model list for custom provider |
 
 ### Model Catalog
 
@@ -144,7 +156,7 @@ Both empty = auth disabled (not recommended).
 | Variable | Default | Description |
 |---|---|---|
 | `PROXY_PORT` | `4000` | Listen port |
-| `DEFAULT_PROVIDER` | auto | Fallback when model is unknown |
+| `DEFAULT_PROVIDER` | auto | Fallback when model is unknown (`deepseek` / `mimo` / `openai` / `custom` / `auto`) |
 | `LOG_LEVEL` | `info` | `silent` / `error` / `warn` / `info` / `debug` |
 | `ACCESS_LOG` | on | Set `0` to suppress per-request access logs |
 | `UPSTREAM_TIMEOUT_MS` | `120000` | Upstream request timeout |
@@ -156,10 +168,10 @@ Both empty = auth disabled (not recommended).
 
 Each request is routed by model name, in priority order:
 
-1. **Exact match** — model appears in `DEEPSEEK_MODELS`, `MIMO_MODELS`, or `OPENAI_MODELS`
+1. **Exact match** — model appears in `DEEPSEEK_MODELS`, `MIMO_MODELS`, `OPENAI_MODELS`, or `CUSTOM_MODELS`
 2. **Prefix heuristic** — model starts with an `OPENAI_MODEL_PREFIXES` entry → OpenAI
-3. **Name hint** — model contains `deepseek` or `mimo` → corresponding provider
-4. **Fallback** — `DEFAULT_PROVIDER`, then first provider with a configured key
+3. **Name hint** — model contains `deepseek`, `mimo`, or `minimax` → corresponding provider
+4. **Fallback** — `DEFAULT_PROVIDER` (including `custom`), then first provider with a configured key
 
 ## Reasoning Effort Translation
 
@@ -248,6 +260,29 @@ cc-switch use codex-bridge
   ```
 - **Multi-key provider locking** — assign each inbound key to a specific provider for multi-profile setups. See `env.example` for the `PROXY_KEYS` format.
 - **Model catalog single source of truth** — point `MODEL_CATALOG_PATH` at the same JSON file Codex uses (`model_catalog_json` in `config.toml`) to keep model lists in sync automatically.
+
+## Auto-Start at Boot (Windows)
+
+Register codex-bridge as a scheduled task so it starts automatically when the machine boots:
+
+```powershell
+# Run as administrator
+powershell -ExecutionPolicy Bypass -File .\register-startup.ps1
+```
+
+This creates a task named `codex-bridge` that:
+- Starts at boot (no login required)
+- Auto-restarts on crash (up to 3 times, 1-minute delay)
+- Reads configuration from `.env`
+
+**Manage the task:**
+
+| Action | Command |
+|---|---|
+| Start | `schtasks /Run /TN "codex-bridge"` |
+| Stop | `schtasks /End /TN "codex-bridge"` |
+| Status | `schtasks /Query /TN "codex-bridge"` |
+| Uninstall | `powershell -ExecutionPolicy Bypass -File .\unregister-startup.ps1` |
 
 ## Troubleshooting
 
