@@ -4,10 +4,10 @@ import fs from "node:fs";
 import { execSync } from "node:child_process";
 
 process.on("uncaughtException", (err) => {
-  log.error("[proxy] uncaught exception:", err.message);
+  log.error("[bridge] uncaught exception:", err.message);
 });
 process.on("unhandledRejection", (err) => {
-  log.error("[proxy] unhandled rejection:", err.message || err);
+  log.error("[bridge] unhandled rejection:", err.message || err);
 });
 
 const PORT = process.env.PROXY_PORT || 4000;
@@ -62,21 +62,21 @@ function loadProxyKeyTable() {
   for (const entry of parseCsv(PROXY_KEYS_RAW)) {
     const idx = entry.lastIndexOf(":");
     if (idx === -1) {
-      log.warn(`[proxy] PROXY_KEYS entry missing ':<provider>': "${entry}" — ignored`);
+      log.warn(`[bridge] PROXY_KEYS entry missing ':<provider>': "${entry}" — ignored`);
       continue;
     }
     const key = entry.slice(0, idx).trim();
     const provider = entry.slice(idx + 1).trim().toLowerCase();
     if (!key) {
-      log.warn(`[proxy] PROXY_KEYS entry has empty key — ignored`);
+      log.warn(`[bridge] PROXY_KEYS entry has empty key — ignored`);
       continue;
     }
     if (!VALID_LOCK_PROVIDERS.has(provider)) {
-      log.warn(`[proxy] PROXY_KEYS entry has unknown provider "${provider}" (allowed: deepseek, mimo, openai, *) — ignored`);
+      log.warn(`[bridge] PROXY_KEYS entry has unknown provider "${provider}" (allowed: deepseek, mimo, openai, *) — ignored`);
       continue;
     }
     if (PROXY_KEY_TABLE.has(key)) {
-      log.warn(`[proxy] PROXY_KEYS entry duplicates key "${key.slice(0, 12)}…" — last wins`);
+      log.warn(`[bridge] PROXY_KEYS entry duplicates key "${key.slice(0, 12)}…" — last wins`);
     }
     PROXY_KEY_TABLE.set(key, provider);
   }
@@ -438,7 +438,7 @@ function storeResponse(id, data) {
 
   responseStore.set(id, { ...data, storedAt: Date.now(), consecutiveToolCalls });
   log.info(
-    `[proxy] stored response ${id} (provider=${data.provider || "unknown"}, store size: ${responseStore.size}${consecutiveToolCalls > 0 ? `, consecutive_tc: ${consecutiveToolCalls}` : ""})`
+    `[bridge] stored response ${id} (provider=${data.provider || "unknown"}, store size: ${responseStore.size}${consecutiveToolCalls > 0 ? `, consecutive_tc: ${consecutiveToolCalls}` : ""})`
   );
 }
 
@@ -451,7 +451,7 @@ function resolveResponseChain(previousResponseId) {
     visited.add(currentId);
     const stored = touchResponse(currentId);
     if (!stored) {
-      log.warn(`[proxy] previous_response_id ${currentId} not found in store`);
+      log.warn(`[bridge] previous_response_id ${currentId} not found in store`);
       break;
     }
     chain.unshift(stored);
@@ -480,7 +480,7 @@ function maybeResolvePreviousResponseChain(body, targetProvider) {
   const previous = responseStore.get(body.previous_response_id);
   if (!previous) {
     if (targetProvider === "deepseek") {
-      log.warn(`[proxy] previous_response_id ${body.previous_response_id} missing; DeepSeek request will continue without restored history`);
+      log.warn(`[bridge] previous_response_id ${body.previous_response_id} missing; DeepSeek request will continue without restored history`);
     }
     return;
   }
@@ -494,7 +494,7 @@ function maybeResolvePreviousResponseChain(body, targetProvider) {
   const currentInput = normalizeInputToArray(body.input);
   body.input = [...chainItems, ...currentInput];
   delete body.previous_response_id;
-  log.info(`[proxy] locally resolved previous_response_id across provider boundary -> ${targetProvider} (${chainItems.length} items prepended)`);
+  log.info(`[bridge] locally resolved previous_response_id across provider boundary -> ${targetProvider} (${chainItems.length} items prepended)`);
 }
 
 // --- Shared message-list normalisation ---
@@ -593,7 +593,7 @@ function normalizeMessages(messages, { coerceStrings = false } = {}) {
             try {
               JSON.parse(args);
             } catch {
-              log.warn(`[proxy] invalid tool_call arguments for ${tc.function.name} (id: ${tc.id}), wrapping as JSON`);
+              log.warn(`[bridge] invalid tool_call arguments for ${tc.function.name} (id: ${tc.id}), wrapping as JSON`);
               tc.function.arguments = JSON.stringify({ input: args });
             }
           }
@@ -768,7 +768,7 @@ function responsesRequestToChatCompletions(body, provider) {
       },
       ...tail,
     ];
-    log.info(`[proxy] trimmed ${merged.length} -> ${finalMessages.length} messages`);
+    log.info(`[bridge] trimmed ${merged.length} -> ${finalMessages.length} messages`);
   }
 
   // After trim we may have left orphan tool messages — re-normalise to drop them.
@@ -829,13 +829,16 @@ function responsesRequestToChatCompletions(body, provider) {
   // explicit effort (then applyEffortTranslation is a no-op and DeepSeek would
   // default to thinking ON).
   if (provider === "deepseek" && req.thinking?.type !== "disabled") {
-    const hasAssistantToolCalls = finalMessages.some(
-      (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0 && !m.reasoning_content
+    // Check ALL assistant messages (not just tool_calls) — DeepSeek V4 requires
+    // reasoning_content on every assistant message in thinking mode. If any
+    // assistant message is missing it, disable thinking to avoid 400.
+    const hasAssistantWithoutReasoning = finalMessages.some(
+      (m) => m.role === "assistant" && !m.reasoning_content
     );
-    if (hasAssistantToolCalls) {
+    if (hasAssistantWithoutReasoning) {
       req.thinking = { type: "disabled" };
       delete req.reasoning_effort;
-      log.info("[proxy] deepseek: assistant tool_calls without reasoning_content -> forcing thinking:disabled");
+      log.info("[bridge] deepseek: assistant messages without reasoning_content -> forcing thinking:disabled");
     }
   }
 
@@ -1097,7 +1100,7 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
   }
 
   if (clientGone(res)) {
-    log.warn(`[proxy] client disconnected mid-stream (${responseId})`);
+    log.warn(`[bridge] client disconnected mid-stream (${responseId})`);
     try { res.end(); } catch { /* ignore */ }
     return { responseId, output: streamOutput || [], reasoningContent };
   }
@@ -1106,7 +1109,7 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
     completionSent = true;
     const wasGenerating = fullText.length > 0 || toolCalls.size > 0;
     const fallbackReason = wasGenerating ? "length" : "stop";
-    log.warn(`[proxy] stream ended without finish_reason (wasGenerating=${wasGenerating}, reason=${fallbackReason})`);
+    log.warn(`[bridge] stream ended without finish_reason (wasGenerating=${wasGenerating}, reason=${fallbackReason})`);
     streamOutput = await sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, fallbackReason, null, previousResponseId, metadata);
   }
 
@@ -1323,7 +1326,7 @@ async function readJsonBody(req, res) {
 
 async function sendUpstreamError(upstreamRes, res) {
   const errText = await upstreamRes.text();
-  log.error(`[proxy] upstream error: ${upstreamRes.status} ${errText}`);
+  log.error(`[bridge] upstream error: ${upstreamRes.status} ${errText}`);
   if (!res.headersSent) {
     res.writeHead(upstreamRes.status, { "Content-Type": upstreamRes.headers.get("content-type") || "application/json" });
     res.end(errText);
@@ -1532,10 +1535,10 @@ async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upst
 
     if (webFetchCalls.length === 0 || loop === MAX_FETCH_LOOPS || isStuckLoop) {
       if (isStuckLoop) {
-        log.warn(`[proxy] ${tag}web_fetch loop stuck — model re-requested same URL(s), breaking early at loop ${loop + 1}`);
+        log.warn(`[bridge] ${tag}web_fetch loop stuck — model re-requested same URL(s), breaking early at loop ${loop + 1}`);
       }
       if (loop === MAX_FETCH_LOOPS && webFetchCalls.length > 0) {
-        log.warn(`[proxy] ${tag}web_fetch MAX_FETCH_LOOPS (${MAX_FETCH_LOOPS}) exhausted — stripping remaining fetches`);
+        log.warn(`[bridge] ${tag}web_fetch MAX_FETCH_LOOPS (${MAX_FETCH_LOOPS}) exhausted — stripping remaining fetches`);
       }
       if (msg?.tool_calls) {
         msg.tool_calls = msg.tool_calls.filter((tc) => tc.function?.name !== "web_fetch");
@@ -1552,19 +1555,19 @@ async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upst
     }
 
     prevFetchUrls = currentFetchUrls;
-    log.info(`[proxy] ${tag}executing ${webFetchCalls.length} web_fetch call(s) (loop ${loop + 1}/${MAX_FETCH_LOOPS})`);
+    log.info(`[bridge] ${tag}executing ${webFetchCalls.length} web_fetch call(s) (loop ${loop + 1}/${MAX_FETCH_LOOPS})`);
     const results = await Promise.all(webFetchCalls.map(async (tc) => {
       const fetchUrl = (() => {
         try { return JSON.parse(tc.function.arguments).url; }
         catch { return "unknown"; }
       })();
       if (fetchCache.has(fetchUrl)) {
-        log.info(`[proxy] ${tag}web_fetch ${fetchUrl} -> ${fetchCache.get(fetchUrl).length} chars (cached)`);
+        log.info(`[bridge] ${tag}web_fetch ${fetchUrl} -> ${fetchCache.get(fetchUrl).length} chars (cached)`);
         return { role: "tool", tool_call_id: tc.id, content: fetchCache.get(fetchUrl) };
       }
       const content = await executeWebFetch(tc.function.arguments);
       fetchCache.set(fetchUrl, content);
-      log.info(`[proxy] ${tag}web_fetch ${fetchUrl} -> ${content.length} chars`);
+      log.info(`[bridge] ${tag}web_fetch ${fetchUrl} -> ${content.length} chars`);
       return { role: "tool", tool_call_id: tc.id, content };
     }));
 
@@ -1576,7 +1579,7 @@ async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upst
   }
 
   if (fetchLoopCount > 0) {
-    log.info(`[proxy] ${tag}web_fetch resolved after ${fetchLoopCount} loop(s)`);
+    log.info(`[bridge] ${tag}web_fetch resolved after ${fetchLoopCount} loop(s)`);
   }
   return { ok: true, response: finalCcResponse };
 }
@@ -1597,7 +1600,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     const prevStored = touchResponse(originalPreviousResponseId);
     const consecutiveTc = prevStored?.consecutiveToolCalls || 0;
     if (consecutiveTc >= MAX_CONSECUTIVE_TOOL_CALLS) {
-      log.warn(`[proxy] CIRCUIT BREAKER: ${consecutiveTc} consecutive tool-call-only responses detected — injecting stop-loop nudge`);
+      log.warn(`[bridge] CIRCUIT BREAKER: ${consecutiveTc} consecutive tool-call-only responses detected — injecting stop-loop nudge`);
       const nudge = {
         type: "message",
         role: "user",
@@ -1609,7 +1612,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
       const currentInput = normalizeInputToArray(body.input);
       body.input = [...currentInput, nudge];
     } else if (consecutiveTc >= Math.floor(MAX_CONSECUTIVE_TOOL_CALLS * 0.75)) {
-      log.warn(`[proxy] tool-call loop warning: ${consecutiveTc}/${MAX_CONSECUTIVE_TOOL_CALLS} consecutive tool-call responses`);
+      log.warn(`[bridge] tool-call loop warning: ${consecutiveTc}/${MAX_CONSECUTIVE_TOOL_CALLS} consecutive tool-call responses`);
     }
   }
 
@@ -1630,7 +1633,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     const prevStored = touchResponse(originalPreviousResponseId);
     const consecutiveTc = prevStored?.consecutiveToolCalls || 0;
     if (consecutiveTc >= MAX_CONSECUTIVE_TOOL_CALLS + 3) {
-      log.warn("[proxy] HARD CIRCUIT BREAKER: stripping all tools to force text response");
+      log.warn("[bridge] HARD CIRCUIT BREAKER: stripping all tools to force text response");
       delete chatReq.tools;
       delete chatReq.tool_choice;
       hardBreakerFired = true;
@@ -1644,7 +1647,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
   }
 
   log.info(
-    `[proxy] ${routeLabel} | stream=${isStream} | messages=${chatReq.messages.length}${hasConversationUrls ? " | web_fetch_injected" : ""} | roles=[${chatReq.messages.map((m) => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`
+    `[bridge] ${routeLabel} | stream=${isStream} | messages=${chatReq.messages.length}${hasConversationUrls ? " | web_fetch_injected" : ""} | roles=[${chatReq.messages.map((m) => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`
   );
 
   if (hasConversationUrls) {
@@ -1756,7 +1759,7 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
     body.messages = ensureWebFetchHint(body.messages);
   }
 
-  log.info(`[proxy] chat/completions ${provider}(${body.model}) | stream=${isStream} | messages=${body.messages.length}${ccHasUrls ? " | web_fetch_injected" : ""} | roles=[${body.messages.map((m) => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`);
+  log.info(`[bridge] chat/completions ${provider}(${body.model}) | stream=${isStream} | messages=${body.messages.length}${ccHasUrls ? " | web_fetch_injected" : ""} | roles=[${body.messages.map((m) => m.role + (m.tool_calls ? "(tc)" : "")).join(",")}]`);
 
   if (ccHasUrls) {
     const result = await runWebFetchLoop({
@@ -1906,7 +1909,7 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    log.info(`[proxy] /cop ${method} ${url}`);
+    log.info(`[bridge] /cop ${method} ${url}`);
     const content = await executeWebFetch({ url, method, headers: headers2, body: body2 });
     res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
     res.end(content);
@@ -2011,7 +2014,7 @@ const server = http.createServer(async (req, res) => {
         }
         const originalPreviousResponseId = body.previous_response_id || null;
         maybeResolvePreviousResponseChain(body, "openai");
-        log.info(`[proxy] responses openai(${body.model || OPENAI_MODELS[0] || "default"}) | stream=${!!body.stream}`);
+        log.info(`[bridge] responses openai(${body.model || OPENAI_MODELS[0] || "default"}) | stream=${!!body.stream}`);
         await forwardOpenAIResponses(req, body, res, originalInput, originalPreviousResponseId);
         return;
       }
@@ -2023,7 +2026,7 @@ const server = http.createServer(async (req, res) => {
 
       sendJson(res, 400, { error: { message: `Unknown provider resolved: ${provider}` } });
     } catch (err) {
-      log.error("[proxy] responses route error:", err.message);
+      log.error("[bridge] responses route error:", err.message);
       if (!res.headersSent) sendJson(res, 500, { error: { message: err.message } });
     }
     return;
@@ -2059,7 +2062,7 @@ const server = http.createServer(async (req, res) => {
           sendJson(res, 400, { error: { message: "OPENAI_API_KEY is not configured" } });
           return;
         }
-        log.info(`[proxy] chat/completions openai(${body.model || OPENAI_MODELS[0] || "default"}) | stream=${!!body.stream}`);
+        log.info(`[bridge] chat/completions openai(${body.model || OPENAI_MODELS[0] || "default"}) | stream=${!!body.stream}`);
         await forwardOpenAIChatCompletions(req, body, res);
         return;
       }
@@ -2071,7 +2074,7 @@ const server = http.createServer(async (req, res) => {
 
       sendJson(res, 400, { error: { message: `Unknown provider resolved: ${provider}` } });
     } catch (err) {
-      log.error("[proxy] chat/completions route error:", err.message);
+      log.error("[bridge] chat/completions route error:", err.message);
       if (!res.headersSent) sendJson(res, 500, { error: { message: err.message } });
     }
     return;
