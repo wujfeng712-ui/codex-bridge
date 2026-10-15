@@ -1,7 +1,10 @@
 import http from "node:http";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { execSync } from "node:child_process";
+import { dedupeInput } from "./dedupe-input.mjs";
 
 process.on("uncaughtException", (err) => {
   log.error("[proxy] uncaught exception:", err.message);
@@ -31,6 +34,68 @@ const log = {
   debug: (...a) => { if (LOG_LEVEL >= LOG_LEVELS.debug) console.log(...a); },
   access: (...a) => { if (ACCESS_LOG_ON) console.log(...a); },
 };
+
+// 守卫式 JSON 解析：仅当字符串以 JSON 对象/数组（{ 或 [）开头时才尝试解析，
+// 否则直接返回 null。这样模型生成的 `String.fromCharCode(...)` 之类纯文本
+// 不会被喂进 JSON.parse，从根上避免 "Unexpected token 'r', ... is not valid JSON"。
+// 非字符串输入原样返回，便于复用 "对象或原值" 的调用语义。
+// === Input de-duplication (fixes the repetition problem) ===
+//
+// Long Codex Desktop sessions accumulate the SAME items into `input` from two
+// independent sources: (a) the auto-continuation loop re-sends the goal block
+// once per turn, and (b) every tool round-trip appends an empty
+// `function_call_output`. A real captured request held 630 items of which only
+// 238 were distinct (goal block x51, empty tool outputs x213). The model then
+// mirrors that redundancy back as textual repetition.
+//
+// `dedupeInput` (see dedupe-input.mjs) is pure: it keeps the LAST byte-identical
+// occurrence of each fingerprint, keeps every singleton, and repairs tool
+// pairing by dropping outputs whose call_id lost its function_call. This wrapper
+// mutates `body.input` in place, logs what it removed, and is fail-open: any
+// error leaves `body` untouched so de-duplication can never break a valid request.
+const DEDUPE_INPUT_ON = (process.env.DEDUPE_INPUT || "on").trim().toLowerCase() !== "off";
+
+function applyInputDedupe(body, provider) {
+  // Returns the exact item array that will be forwarded upstream, so callers can
+  // persist the DEDUPED history instead of the raw inbound body. Storing the raw
+  // array broke the point of dedupe: every subsequent turn replayed the
+  // duplicated items from the response store and the upstream prompt grew by
+  // ~11 redundant items per round-trip.
+  if (!body || !Array.isArray(body.input) || body.input.length === 0) {
+    return Array.isArray(body && body.input) ? body.input : null;
+  }
+  if (!DEDUPE_INPUT_ON) return body.input;
+  try {
+    const before = body.input.length;
+    const result = dedupeInput(body.input);
+    if (!result || !Array.isArray(result.items)) return body.input;
+    if (result.removed === 0 && result.orphanOutputsDropped === 0) return body.input;
+    body.input = result.items;
+    const top = (result.groups || []).slice(0, 3)
+      .map((g) => `${g.dropped}x ${g.fingerprint}`)
+      .join(" | ");
+    log.info(
+      `[dedupe] ${provider}: input ${before} -> ${result.items.length} `
+        + `(removed ${result.removed}, orphan outputs ${result.orphanOutputsDropped})`
+        + (top ? ` top: ${top}` : ""),
+    );
+    return body.input;
+  } catch (err) {
+    log.warn(`[dedupe] ${provider}: skipped due to error: ${err && err.message}`);
+    return body.input;
+  }
+}
+
+function safeParse(text) {
+  if (typeof text !== "string") return text;
+  const trimmed = text.trim();
+  if (!trimmed || (trimmed[0] !== "{" && trimmed[0] !== "[")) return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
 
 // === Inbound auth ===
 //
@@ -115,8 +180,8 @@ function getGithubToken() {
   return _githubToken;
 }
 
-if (!DEEPSEEK_KEY && !OPENAI_KEY && !MIMO_KEY) {
-  console.error("At least one upstream provider key is required: set DEEPSEEK_API_KEY, MIMO_API_KEY, and/or OPENAI_API_KEY");
+if (!DEEPSEEK_KEY && !OPENAI_KEY && !MIMO_KEY && !GLM_KEY) {
+  console.error("At least one upstream provider key is required: set DEEPSEEK_API_KEY, MIMO_API_KEY, GLM_API_KEY, and/or OPENAI_API_KEY");
   process.exit(1);
 }
 
@@ -129,7 +194,7 @@ if (!DEEPSEEK_KEY && !OPENAI_KEY && !MIMO_KEY) {
 const MODEL_CATALOG_PATH = (process.env.MODEL_CATALOG_PATH || "").trim();
 function loadCatalogModels(path) {
   try {
-    const raw = JSON.parse(fs.readFileSync(path, "utf-8"));
+    const raw = safeParse(fs.readFileSync(path, "utf-8"));
     const out = { deepseek: [], mimo: [], openai: [] };
     for (const m of raw.models || []) {
       if (!m?.slug) continue;
@@ -159,9 +224,14 @@ if (CATALOG) {
 // OpenAI-compatible Chat Completions upstreams that share the DeepSeek adapter pipeline
 // (Responses-API ⇄ Chat-Completions translation, web_fetch injection, streaming bridge, etc.).
 // Add new ones (Kimi, Zhipu, ...) by appending another entry — no other code changes needed.
+const GLM_BASE = process.env.GLM_BASE_URL || "https://open.bigmodel.cn/api/paas/v4";
+const GLM_KEY = process.env.GLM_API_KEY || "";
+const GLM_MODELS = parseCsv(process.env.GLM_MODELS || "glm-5.3-flash,glm-4.6");
+
 const OAI_COMPAT_PROVIDERS = {
   deepseek: { base: DEEPSEEK_BASE, key: DEEPSEEK_KEY, models: DEEPSEEK_MODELS, defaultModel: DEEPSEEK_MODELS[0] || "deepseek-v4-pro", envKey: "DEEPSEEK_API_KEY" },
   mimo:     { base: MIMO_BASE,     key: MIMO_KEY,     models: MIMO_MODELS,     defaultModel: MIMO_MODELS[0]     || "mimo-v2.5-pro",   envKey: "MIMO_API_KEY"     },
+  glm:      { base: GLM_BASE,      key: GLM_KEY,      models: GLM_MODELS,      defaultModel: GLM_MODELS[0]      || "glm-5.3-flash",  envKey: "GLM_API_KEY"      },
 };
 
 const enabledProviders = new Set();
@@ -193,6 +263,47 @@ const STORE_TTL = Number(process.env.STORE_TTL_MS) || 60 * 60 * 1000; // 1 hour
 const STORE_MAX = Number(process.env.STORE_MAX) || 500;
 const MAX_CONSECUTIVE_TOOL_CALLS = Number(process.env.MAX_CONSECUTIVE_TOOL_CALLS) || 20; // circuit breaker threshold
 const UPSTREAM_TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT_MS) || 120000; // 2 min, applies to upstream chat/completions/responses calls
+
+// --- Response store persistence (survives proxy restarts) ---
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const STORE_FILE = path.join(__dirname, "response_store.json");
+
+function loadResponseStore() {
+  try {
+    if (fs.existsSync(STORE_FILE)) {
+      const raw = safeParse(fs.readFileSync(STORE_FILE, "utf-8"));
+      const now = Date.now();
+      let loaded = 0, expired = 0;
+      for (const [id, entry] of Object.entries(raw)) {
+        if (now - entry.storedAt > STORE_TTL) { expired++; continue; }
+        responseStore.set(id, entry);
+        loaded++;
+      }
+      if (loaded > 0 || expired > 0) {
+        log.info(`[proxy] response store: loaded ${loaded} entries from disk (${expired} expired)`);
+      }
+    }
+  } catch (err) {
+    log.warn(`[proxy] failed to load response store: ${err.message}`);
+  }
+}
+
+let _persistTimer = null;
+function persistResponseStore() {
+  if (_persistTimer) clearTimeout(_persistTimer);
+  _persistTimer = setTimeout(() => {
+    _persistTimer = null;
+    try {
+      const obj = Object.fromEntries(responseStore);
+      fs.writeFile(STORE_FILE, JSON.stringify(obj), "utf-8", (err) => {
+        if (err) log.warn(`[proxy] failed to persist response store: ${err.message}`);
+      });
+    } catch (err) {
+      log.warn(`[proxy] failed to persist response store: ${err.message}`);
+    }
+  }, 1000); // debounce 1s
+}
 
 // --- Proxy-side web_fetch tool (bypasses sandbox restrictions) ---
 
@@ -294,7 +405,8 @@ async function rawFetch(url, method = "GET", headers = {}, reqBody = null) {
 
 async function executeWebFetch(argsStr) {
   try {
-    const args = typeof argsStr === "string" ? JSON.parse(argsStr) : argsStr;
+    const args = safeParse(argsStr);
+    if (args === null) return "Fetch error: invalid tool_call arguments (not JSON)";
     const { url, method = "GET", headers = {}, body: reqBody } = args;
     if (!url) return "Error: no URL provided";
     if (method === "GET") return await jinaRead(url);
@@ -376,6 +488,7 @@ function getFallbackProvider() {
 const OAI_COMPAT_NAME_HINTS = [
   { provider: "deepseek", tokens: ["deepseek"] },
   { provider: "mimo",     tokens: ["mimo", "xiaomi"] },
+  { provider: "glm",      tokens: ["glm"] },
 ];
 
 function resolveProviderForModel(model) {
@@ -440,6 +553,7 @@ function storeResponse(id, data) {
   log.info(
     `[proxy] stored response ${id} (provider=${data.provider || "unknown"}, store size: ${responseStore.size}${consecutiveToolCalls > 0 ? `, consecutive_tc: ${consecutiveToolCalls}` : ""})`
   );
+  persistResponseStore();
 }
 
 function resolveResponseChain(previousResponseId) {
@@ -506,6 +620,39 @@ function maybeResolvePreviousResponseChain(body, targetProvider) {
 //   4. Drop orphan tool messages
 //   5. Coerce tool_call.arguments / tool.content to strings (only used by the CC path)
 // They used to maintain two separate copies. This is the single source of truth.
+
+// Convert Responses-API style content parts (input_text / output_text / input_image)
+// into Chat-Completions style parts (text / image_url). Some clients (e.g. Open Design)
+// post to /v1/chat/completions with Responses-style parts; without this the upstream
+// rejects them with "unknown variant `input_image`".
+function convertResponsesContentParts(messages) {
+  for (const msg of messages) {
+    if (!msg || !Array.isArray(msg.content)) continue;
+    if (msg.role === "tool") {
+      // Chat-Completions tool messages require plain string content.
+      msg.content = msg.content
+        .map((b) => (typeof b === "string" ? b : b?.text || JSON.stringify(b)))
+        .join("\n");
+      continue;
+    }
+    const converted = [];
+    for (const block of msg.content) {
+      if (typeof block === "string") { converted.push({ type: "text", text: block }); continue; }
+      if (!block || typeof block !== "object") continue;
+      if (block.type === "input_text" || block.type === "output_text" || block.type === "text") {
+        if (block.text) converted.push({ type: "text", text: block.text });
+      } else if (block.type === "input_image" || block.type === "image_url") {
+        const url = block.image_url || block.url || block.image_url?.url;
+        if (url) converted.push({ type: "image_url", image_url: { url: typeof url === "string" ? url : url.url } });
+      }
+      // Unknown block types (thinking, tool_use, ...) are dropped — upstreams reject them.
+    }
+    if (converted.length === 0) converted.push({ type: "text", text: "(non-text content omitted)" });
+    msg.content = converted.length === 1 && converted[0].type === "text" ? converted[0].text : converted;
+  }
+  return messages;
+}
+
 function normalizeMessages(messages, { coerceStrings = false } = {}) {
   // Pass 1: re-order tool replies adjacent to their tool_calls.
   const work = [...messages];
@@ -559,7 +706,15 @@ function normalizeMessages(messages, { coerceStrings = false } = {}) {
       prev && prev.role === "assistant" && msg.role === "assistant" &&
       prev.tool_calls && !msg.tool_calls
     ) {
-      // Drop text-only assistant after tool_calls.
+      // Keep the text: attach it to the preceding tool_calls assistant message.
+      // Dropping it made the model blind to what it had already answered, which
+      // caused it to redo the same work and repeat whole responses.
+      if (typeof msg.content === "string" && msg.content.length > 0) {
+        prev.content =
+          typeof prev.content === "string" && prev.content.length > 0
+            ? prev.content + "\n\n" + msg.content
+            : msg.content;
+      }
     } else {
       merged.push(msg);
     }
@@ -590,9 +745,7 @@ function normalizeMessages(messages, { coerceStrings = false } = {}) {
           } else if (typeof args !== "string") {
             tc.function.arguments = JSON.stringify(args);
           } else {
-            try {
-              JSON.parse(args);
-            } catch {
+            if (safeParse(args) === null) {
               log.warn(`[proxy] invalid tool_call arguments for ${tc.function.name} (id: ${tc.id}), wrapping as JSON`);
               tc.function.arguments = JSON.stringify({ input: args });
             }
@@ -703,7 +856,11 @@ function responsesRequestToChatCompletions(body, provider) {
       // accepts that form too).
       const itemType = item.type || (item.role ? "message" : undefined);
       if (itemType === "message") {
-        const role = (item.role === "developer" || item.role === "system") ? "user" : item.role;
+        // Keep system/developer instructions in their own role. Mapping them to
+        // "user" made the fixed preamble (persona + <skills_instructions> +
+        // permissions + collaboration mode, ~117KB) look like something the user
+        // said, so the model reacted to it every turn and repeated itself.
+        const role = (item.role === "developer") ? "system" : item.role;
         let content;
 
         if (typeof item.content === "string") {
@@ -717,8 +874,12 @@ function responsesRequestToChatCompletions(body, provider) {
             }
             return block;
           });
-          if (content.length === 1 && content[0].type === "text") {
-            content = content[0].text;
+          // Collapse to a plain string whenever every part is text. Chat
+          // Completions treats array content as multimodal parts; leaving a
+          // 4-part text-only array made upstream re-expand the same ~100KB of
+          // instructions instead of reading them as one message.
+          if (content.length > 0 && content.every((part) => part && part.type === "text")) {
+            content = content.map((part) => part.text ?? "").join("\n\n");
           }
         }
 
@@ -743,7 +904,7 @@ function responsesRequestToChatCompletions(body, provider) {
     flushPendingToolCalls();
   }
 
-  const merged = normalizeMessages(messages);
+  const merged = convertResponsesContentParts(normalizeMessages(messages));
 
   const TOOL_OUTPUT_MAX = 2000;
   const KEEP_RECENT_FULL = 10;
@@ -754,25 +915,76 @@ function responsesRequestToChatCompletions(body, provider) {
     }
   }
 
+  // Hard cap: even recent tool outputs must never exceed TOOL_OUTPUT_HARD_MAX. A single
+  // multi-MB tool output (e.g. base64 image read from disk) is useless to the model and
+  // blows past upstream prompt limits (Zhipu 1261 "Prompt exceeds max length").
+  const TOOL_OUTPUT_HARD_MAX = 40000;
+  for (const msg of merged) {
+    if (msg.role === "tool" && typeof msg.content === "string" && msg.content.length > TOOL_OUTPUT_HARD_MAX) {
+      const head = msg.content.slice(0, 30000);
+      const tail = msg.content.slice(-5000);
+      msg.content = head + "\n...[output truncated: " + (msg.content.length - 35000) + " chars removed (oversized tool output)]...\n" + tail;
+    }
+  }
+
+  // Context window trimming.
+  //
+  // Two bugs lived here. First, `head = merged.slice(0, 2)` pinned the first two
+  // messages on every single request, so the fixed preamble was re-sent verbatim
+  // forever. Second, `tail` was cut by raw message count, which could land in the
+  // middle of a tool round-trip and strand an `assistant(tool_calls)` without its
+  // `tool` results; the model then saw a call it never got an answer to and issued
+  // it again, which is what surfaced as duplicated work.
+  //
+  // The trim now keeps the system preamble once and walks the cut point back to a
+  // turn boundary so tool call/result pairs stay intact.
   const MAX_MESSAGES = 55;
   let finalMessages = merged;
   if (merged.length > MAX_MESSAGES) {
-    const head = merged.slice(0, 2);
-    let tail = merged.slice(-(MAX_MESSAGES - 3));
-    while (tail.length > 0 && tail[0].role === "tool") tail.shift();
-    finalMessages = [
-      ...head,
-      {
-        role: "user",
-        content: "[Earlier conversation trimmed. Do not repeat previous statements or tool calls you already made. Continue with the current task. If you have enough information, respond to the user instead of making more tool calls.]",
-      },
-      ...tail,
-    ];
-    log.info(`[proxy] trimmed ${merged.length} -> ${finalMessages.length} messages`);
+    // Keep the leading system/developer preamble, but only one copy.
+    const head = [];
+    for (const msg of merged) {
+      if (msg.role === "system" && head.length === 0) head.push(msg);
+      else break;
+    }
+
+    const budget = Math.max(1, MAX_MESSAGES - head.length - 1);
+    let start = Math.max(head.length, merged.length - budget);
+
+    // Walk the cut point backwards until the tail begins on a turn boundary.
+    // A tail may not start with a `tool` result (its call would be gone) and may
+    // not start with an assistant whose `tool_calls` results were cut off.
+    while (start > head.length) {
+      const first = merged[start];
+      const prev = merged[start - 1];
+      const startsWithOrphanTool = first.role === "tool";
+      const prevHasDanglingCalls =
+        prev && prev.role === "assistant" && Array.isArray(prev.tool_calls) && prev.tool_calls.length > 0;
+      if (!startsWithOrphanTool && !prevHasDanglingCalls) break;
+      start--;
+    }
+
+    // If the walk ran all the way back, there is nothing worth trimming.
+    if (start <= head.length) {
+      finalMessages = merged;
+    } else {
+      const tail = merged.slice(start);
+      finalMessages = [
+        ...head,
+        {
+          role: "user",
+          content: "[Earlier conversation trimmed. Continue with the current task. If you have enough information, respond to the user instead of making more tool calls.]",
+        },
+        ...tail,
+      ];
+      log.info(
+        `[proxy] trimmed ${merged.length} -> ${finalMessages.length} messages (turn-aligned, cut at ${start})`,
+      );
+    }
   }
 
   // After trim we may have left orphan tool messages — re-normalise to drop them.
-  if (merged.length > MAX_MESSAGES) {
+  if (finalMessages !== merged) {
     finalMessages = normalizeMessages(finalMessages);
   }
 
@@ -990,6 +1202,7 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
   const toolCalls = new Map();
   let outputIndex = 0;
   let textOutputIdx = -1;
+  let messageItemId = null;
   let buffer = "";
   let streamOutput = null;
   const decoder = new TextDecoder();
@@ -1007,15 +1220,14 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
         if (data === "[DONE]") {
           if (!completionSent) {
             completionSent = true;
-            streamOutput = await sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, null, null, previousResponseId, metadata);
+            streamOutput = await sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, messageItemId, null, null, previousResponseId, metadata);
           }
           continue;
         }
 
-        let parsed;
-        try {
-          parsed = JSON.parse(data);
-        } catch {
+        const parsed = safeParse(data);
+        if (parsed === null) {
+          log.debug(`[proxy] skipping non-JSON upstream SSE line: ${data.slice(0, 80)}`);
           continue;
         }
 
@@ -1048,7 +1260,7 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
           }
           if (finishReason && !completionSent) {
             completionSent = true;
-            streamOutput = await sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, finishReason, parsed.usage, previousResponseId, metadata);
+            streamOutput = await sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, messageItemId, finishReason, parsed.usage, previousResponseId, metadata);
           }
           continue;
         }
@@ -1074,7 +1286,7 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
             textOutputIdx = outputIndex + toolCalls.size;
             await writeWithBackpressure(res, events.outputItemAdded(textOutputIdx, {
               type: "message",
-              id: `msg_${uid()}`,
+              id: messageItemId = `msg_${uid()}`,
               status: "in_progress",
               role: "assistant",
               content: [],
@@ -1088,7 +1300,7 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
 
         if (finishReason && !completionSent) {
           completionSent = true;
-          streamOutput = await sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, finishReason, parsed.usage, previousResponseId, metadata);
+          streamOutput = await sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, messageItemId, finishReason, parsed.usage, previousResponseId, metadata);
         }
       }
     }
@@ -1107,14 +1319,14 @@ async function handleStreamingResponse(req, upstreamRes, res, model, previousRes
     const wasGenerating = fullText.length > 0 || toolCalls.size > 0;
     const fallbackReason = wasGenerating ? "length" : "stop";
     log.warn(`[proxy] stream ended without finish_reason (wasGenerating=${wasGenerating}, reason=${fallbackReason})`);
-    streamOutput = await sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, fallbackReason, null, previousResponseId, metadata);
+    streamOutput = await sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, messageItemId, fallbackReason, null, previousResponseId, metadata);
   }
 
   res.end();
   return { responseId, output: streamOutput || [], reasoningContent };
 }
 
-async function sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, finishReason, usage, previousResponseId, metadata) {
+async function sendCompletion(res, events, responseId, model, fullText, toolCalls, outputIndex, textOutputIdx, textOutputId, finishReason, usage, previousResponseId, metadata) {
   for (const [idx, tc] of toolCalls) {
     const tcIdx = tc.outputIdx != null ? tc.outputIdx : outputIndex + idx;
     await writeWithBackpressure(res, events.fnCallArgsDone(tcIdx, tc.callId, tc.arguments));
@@ -1136,7 +1348,7 @@ async function sendCompletion(res, events, responseId, model, fullText, toolCall
     await writeWithBackpressure(res, events.contentPartDone(msgOutIdx, 0, donePart));
     await writeWithBackpressure(res, events.outputItemDone(msgOutIdx, {
       type: "message",
-      id: `msg_${uid()}`,
+      id: textOutputId || `msg_${uid()}`,
       status: "completed",
       role: "assistant",
       content: [donePart],
@@ -1163,7 +1375,7 @@ async function sendCompletion(res, events, responseId, model, fullText, toolCall
       sortIdx: msgOutIdx,
       item: {
         type: "message",
-        id: `msg_${uid()}`,
+        id: textOutputId || `msg_${uid()}`,
         status: "completed",
         role: "assistant",
         content: [{ type: "output_text", text: trimmed, annotations: [] }],
@@ -1282,7 +1494,8 @@ function wireClientCancel(res, upstreamRes) {
   const onClose = () => {
     if (cancelled) return;
     cancelled = true;
-    try { upstreamRes.body.cancel?.(); } catch { /* ignore */ }
+    // Node v24: ReadableStream.cancel() may throw if body is locked.
+    // Avoid entirely — the upstream stream will be GC'd when no longer referenced.
   };
   res.once("close", onClose);
   return () => {
@@ -1313,12 +1526,12 @@ function writeWithBackpressure(res, chunk) {
 async function readJsonBody(req, res) {
   let rawBody = "";
   for await (const chunk of req) rawBody += chunk;
-  try {
-    return JSON.parse(rawBody);
-  } catch {
+  const parsed = safeParse(rawBody);
+  if (parsed === null) {
     sendJson(res, 400, { error: "Invalid JSON" });
     return null;
   }
+  return parsed;
 }
 
 async function sendUpstreamError(upstreamRes, res) {
@@ -1354,13 +1567,10 @@ async function pipeResponsesStreamAndCapture(req, upstreamRes, res, onCompleted)
     const data = dataLines.join("\n");
     if (!data || data === "[DONE]") return;
 
-    try {
-      const parsed = JSON.parse(data);
-      if (eventType === "response.completed" || parsed.type === "response.completed") {
-        onCompleted(parsed.response || parsed);
-      }
-    } catch {
-      // Ignore parse failures in streamed event capture; stream still passes through.
+    const parsed = safeParse(data);
+    if (parsed === null) return;
+    if (eventType === "response.completed" || parsed.type === "response.completed") {
+      try { onCompleted(parsed.response || parsed); } catch { /* ignore */ }
     }
   };
 
@@ -1397,6 +1607,8 @@ async function forwardOpenAIResponses(req, body, res, originalInput, originalPre
     // minimal / low / medium / high pass through.
   }
 
+  let dedupedInput = applyInputDedupe(body, "openai");
+
   const upstreamRes = await fetchWithTimeout(`${OPENAI_BASE}/responses`, {
     method: "POST",
     headers: {
@@ -1416,7 +1628,7 @@ async function forwardOpenAIResponses(req, body, res, originalInput, originalPre
       if (completedResponse?.id && Array.isArray(completedResponse.output)) {
         storeResponse(completedResponse.id, {
           provider: "openai",
-          input: originalInput,
+          input: dedupedInput,
           output: completedResponse.output,
           previousResponseId: originalPreviousResponseId || null,
         });
@@ -1429,7 +1641,7 @@ async function forwardOpenAIResponses(req, body, res, originalInput, originalPre
   if (response?.id && Array.isArray(response.output)) {
     storeResponse(response.id, {
       provider: "openai",
-      input: originalInput,
+      input: dedupedInput,
       output: response.output,
       previousResponseId: originalPreviousResponseId || null,
     });
@@ -1508,6 +1720,12 @@ async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upst
 
   for (let loop = 0; loop <= MAX_FETCH_LOOPS; loop++) {
     const loopReq = { ...baseRequest, messages: loopMessages, stream: false };
+    // DeepSeek requires reasoning_content round-trip in thinking mode.
+    // Web-fetch loops always involve assistant tool_calls, so disable thinking.
+    if (loopReq.thinking?.type !== "disabled") {
+      loopReq.thinking = { type: "disabled" };
+      delete loopReq.reasoning_effort;
+    }
     const upstreamRes = await fetchWithTimeout(upstreamUrl, {
       method: "POST",
       headers: {
@@ -1525,8 +1743,8 @@ async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upst
     const msg = ccResponse.choices?.[0]?.message;
     const webFetchCalls = (msg?.tool_calls || []).filter((tc) => tc.function?.name === "web_fetch");
     const currentFetchUrls = webFetchCalls.map((tc) => {
-      try { return JSON.parse(tc.function.arguments).url; }
-      catch { return ""; }
+      const args = safeParse(tc.function.arguments);
+      return (args && typeof args === "object") ? args.url : "";
     }).sort().join("|");
     const isStuckLoop = webFetchCalls.length > 0 && currentFetchUrls === prevFetchUrls;
 
@@ -1555,8 +1773,8 @@ async function runWebFetchLoop({ baseRequest, initialMessages, upstreamUrl, upst
     log.info(`[proxy] ${tag}executing ${webFetchCalls.length} web_fetch call(s) (loop ${loop + 1}/${MAX_FETCH_LOOPS})`);
     const results = await Promise.all(webFetchCalls.map(async (tc) => {
       const fetchUrl = (() => {
-        try { return JSON.parse(tc.function.arguments).url; }
-        catch { return "unknown"; }
+        const args = safeParse(tc.function.arguments);
+        return (args && typeof args === "object") ? args.url : "unknown";
       })();
       if (fetchCache.has(fetchUrl)) {
         log.info(`[proxy] ${tag}web_fetch ${fetchUrl} -> ${fetchCache.get(fetchUrl).length} chars (cached)`);
@@ -1592,6 +1810,10 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
 
   const originalPreviousResponseId = body.previous_response_id || null;
   maybeResolvePreviousResponseChain(body, provider);
+  // Snapshot the deduped history AFTER chain resolution so the response store
+  // records exactly what the upstream saw. Persisting the raw inbound array
+  // re-injected previously dropped duplicates on every replay.
+  let dedupedInput = applyInputDedupe(body, provider);
 
   if (originalPreviousResponseId) {
     const prevStored = touchResponse(originalPreviousResponseId);
@@ -1607,7 +1829,11 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
         }],
       };
       const currentInput = normalizeInputToArray(body.input);
+      // The nudge is transient by design: it shapes THIS upstream call only and
+      // must not be persisted into the stored history, otherwise every later
+      // turn replays the same "stop looping" instruction.
       body.input = [...currentInput, nudge];
+      dedupedInput = currentInput;
     } else if (consecutiveTc >= Math.floor(MAX_CONSECUTIVE_TOOL_CALLS * 0.75)) {
       log.warn(`[proxy] tool-call loop warning: ${consecutiveTc}/${MAX_CONSECUTIVE_TOOL_CALLS} consecutive tool-call responses`);
     }
@@ -1637,7 +1863,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     }
   }
 
-  const hasConversationUrls = conversationHasUrls(chatReq.messages);
+  const hasConversationUrls = false; // disabled: conflicts with DeepSeek thinking mode
   if (hasConversationUrls) {
     chatReq.tools = ensureWebFetchTool(chatReq.tools);
     chatReq.messages = ensureWebFetchHint(chatReq.messages);
@@ -1662,7 +1888,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     const responsesResponse = chatCompletionToResponse(result.response, body.model, originalPreviousResponseId, body.metadata);
     storeResponse(responsesResponse.id, {
       provider,
-      input: originalInput,
+      input: dedupedInput,
       output: responsesResponse.output,
       previousResponseId: originalPreviousResponseId,
       breakerFired: hardBreakerFired,
@@ -1674,16 +1900,28 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     return;
   }
 
+  const upstreamPayload = JSON.stringify(chatReq);
+  log.info(`[proxy] responses->chat ${routeLabel} | upstream payload ${(upstreamPayload.length / 1024).toFixed(0)}KB | messages=${chatReq.messages ? chatReq.messages.length : 0}`);
+
   const upstreamRes = await fetchWithTimeout(upstreamUrl, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       Authorization: `Bearer ${upstreamKey}`,
     },
-    body: JSON.stringify(chatReq),
+    body: upstreamPayload,
   });
 
   if (!upstreamRes.ok) {
+    const errText = await upstreamRes.text().catch(() => "");
+    log.error(`[proxy] upstream ${upstreamRes.status} from ${upstreamUrl}: ${errText.slice(0, 300)}`);
+    try {
+      const dumpDir = path.join(process.cwd(), "debug-dumps");
+      fs.mkdirSync(dumpDir, { recursive: true });
+      const perMsg = (chatReq.messages || []).map((m, i) => `[${i}] role=${m.role} len=${JSON.stringify(m).length}`).join("\n");
+      fs.writeFileSync(path.join(dumpDir, `fail-${Date.now()}.txt`), `STATUS ${upstreamRes.status}\n${errText}\n\nPER-MESSAGE:\n${perMsg}\n\n` + upstreamPayload.slice(0, 2000000));
+      log.error(`[proxy] failed payload dumped to debug-dumps/`);
+    } catch (e) { log.error(`[proxy] dump failed: ${e.message}`); }
     await sendUpstreamError(upstreamRes, res);
     return;
   }
@@ -1699,7 +1937,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
     );
     storeResponse(streamRespId, {
       provider,
-      input: originalInput,
+      input: dedupedInput,
       output: streamOutput,
       previousResponseId: originalPreviousResponseId,
       breakerFired: hardBreakerFired,
@@ -1713,7 +1951,7 @@ async function handleOaiCompatResponses(req, provider, body, res, originalInput)
   const nonStreamReasoning = ccResponse.choices?.[0]?.message?.reasoning_content || "";
   storeResponse(responsesResponse.id, {
     provider,
-    input: originalInput,
+    input: dedupedInput,
     output: responsesResponse.output,
     reasoningContent: nonStreamReasoning,
     previousResponseId: originalPreviousResponseId,
@@ -1735,7 +1973,13 @@ async function handleOaiCompatChatCompletions(req, provider, body, res) {
   const isStream = body.stream || false;
 
   const validated = normalizeMessages(body.messages || [], { coerceStrings: true });
-  body.messages = validated;
+  body.messages = convertResponsesContentParts(validated);
+  // Same hard cap as the responses path — oversized tool outputs blow upstream limits.
+  for (const msg of body.messages) {
+    if (msg.role === "tool" && typeof msg.content === "string" && msg.content.length > 40000) {
+      msg.content = msg.content.slice(0, 30000) + "\n...[output truncated: " + (msg.content.length - 35000) + " chars removed]...\n" + msg.content.slice(-5000);
+    }
+  }
   if (!body.max_tokens) body.max_tokens = 16384;
 
   // Translate effort hints on the chat/completions path too. Either:
@@ -2084,6 +2328,8 @@ server.timeout = 0;
 server.keepAliveTimeout = 300000;
 server.headersTimeout = 300000;
 server.requestTimeout = 0;
+
+loadResponseStore();
 
 server.listen(PORT, () => {
   console.log(`[codex-bridge] Listening on http://localhost:${PORT}`);

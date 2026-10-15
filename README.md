@@ -258,6 +258,7 @@ cc-switch use codex-bridge
 | `--env-file: not recognized` | Node.js < 20 | Use `set -a && source .env && set +a && node proxy.mjs` |
 | Upstream timeout | Slow provider response | Increase `UPSTREAM_TIMEOUT_MS` in `.env` (default 120 000 ms) |
 | Model not found | Model not in any `*_MODELS` list | Add it to `DEEPSEEK_MODELS` / `MIMO_MODELS` / `OPENAI_MODELS`, or use `MODEL_CATALOG_PATH` |
+| Model repeats itself / echoes the same paragraph, latency and tokens grow every turn | Outbound prompt was de-duplicated but the **stored** history was not, so duplicates were rehydrated and re-stored each round-trip (~11 redundant items per turn) | Upgrade to a build where `storeResponse` persists the deduped array; existing sessions keep their accumulated history, so start a fresh session. See [duplication case study](./docs/duplication-case-study.md) |
 
 ## Requirements
 
