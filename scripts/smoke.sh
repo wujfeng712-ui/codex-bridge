@@ -57,6 +57,7 @@ elif [[ -n "${PROXY_KEYS:-}" ]]; then
     case "$MODEL" in
       deepseek*) want=deepseek ;;
       mimo*)     want=mimo ;;
+      MiniMax*|minimax*) want=minimax ;;
       *)         want="" ;;
     esac
     if [[ -n "$want" ]]; then
@@ -238,6 +239,7 @@ if [[ -n "${PROXY_KEYS:-}" ]]; then
   IFS=',' read -ra _entries <<< "$PROXY_KEYS"
   ds_key=""
   mi_key=""
+  mx_key=""
   oa_key=""
   for e in "${_entries[@]}"; do
     e="${e## }"; e="${e%% }"
@@ -247,6 +249,7 @@ if [[ -n "${PROXY_KEYS:-}" ]]; then
     case "$p" in
       deepseek) [[ -z "$ds_key" ]] && ds_key="$k" ;;
       mimo)     [[ -z "$mi_key" ]] && mi_key="$k" ;;
+      minimax)  [[ -z "$mx_key" ]] && mx_key="$k" ;;
       openai)   [[ -z "$oa_key" ]] && oa_key="$k" ;;
     esac
   done
@@ -270,6 +273,12 @@ if [[ -n "${PROXY_KEYS:-}" ]]; then
     check "mimo-key + mimo model"             "200" "$(post_with_key "$mi_key" /v1/responses '{"model":"mimo-v2.5-pro","input":"x"}')"
     if [[ -n "$ds_key" ]]; then
       check "mimo-key + deepseek model 401"   "401" "$(post_with_key "$mi_key" /v1/responses '{"model":"deepseek-v4-flash","input":"x"}')"
+    fi
+  fi
+  if [[ -n "$mx_key" ]]; then
+    check "minimax-key + minimax model"       "200" "$(post_with_key "$mx_key" /v1/responses '{"model":"MiniMax-M3","input":"x"}')"
+    if [[ -n "$ds_key" ]]; then
+      check "minimax-key + deepseek model 401" "401" "$(post_with_key "$mx_key" /v1/responses '{"model":"deepseek-v4-flash","input":"x"}')"
     fi
   fi
 fi

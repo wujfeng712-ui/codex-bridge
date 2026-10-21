@@ -1,8 +1,8 @@
 {
-  "_comment": "Example model catalog for codex-bridge. Copy to ~/.codex/proxy-models.json (or any path) and point both Codex (config.toml -> model_catalog_json) and codex-bridge (.env -> MODEL_CATALOG_PATH) at it. The proxy infers the upstream provider from each slug prefix (deepseek-* / mimo-* / gpt-*).",
+  "_comment": "Example model catalog for codex-bridge. Copy to ~/.codex/proxy-models.json (or any path) and point both Codex (config.toml -> model_catalog_json) and codex-bridge (.env -> MODEL_CATALOG_PATH) at it. The proxy infers the upstream provider from each slug prefix (deepseek-* / mimo-* / minimax-* / gpt-*).",
 
   "_field_reference": {
-    "slug":                          "Model identifier sent by Codex CLI. The proxy uses the prefix (deepseek-* / mimo-* / gpt-*) to route to the correct upstream provider.",
+    "slug": "Model identifier sent by Codex CLI. The proxy uses the prefix (deepseek-* / mimo-* / minimax-* / gpt-*) to route to the correct upstream provider.",
     "display_name":                  "Human-readable name shown in the Codex CLI model picker.",
     "supported_reasoning_levels":    "Array of { effort, description } objects. 'effort' is one of: none | minimal | low | medium | high | xhigh. Codex maps the user's reasoning-effort slider to these values; the proxy then translates them to each provider's native format (see README → Reasoning Effort Translation).",
     "shell_type":                    "Shell environment for Codex CLI sandbox. 'default' uses the system shell.",
@@ -97,6 +97,44 @@
       "visibility": "list",
       "supported_in_api": true,
       "priority": 4,
+      "base_instructions": "",
+      "supports_reasoning_summaries": false,
+      "support_verbosity": false,
+      "truncation_policy": { "mode": "tokens", "limit": 204800 },
+      "supports_parallel_tool_calls": true,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "MiniMax-M3.1-Flash",
+      "display_name": "MiniMax M3.1 Flash",
+      "supported_reasoning_levels": [
+        { "effort": "low",    "description": "Low reasoning effort" },
+        { "effort": "medium", "description": "Medium reasoning effort" },
+        { "effort": "high",   "description": "High reasoning effort" },
+        { "effort": "xhigh",  "description": "Extra-high reasoning effort" }
+      ],
+      "shell_type": "default",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 5,
+      "base_instructions": "",
+      "supports_reasoning_summaries": false,
+      "support_verbosity": false,
+      "truncation_policy": { "mode": "tokens", "limit": 204800 },
+      "supports_parallel_tool_calls": true,
+      "experimental_supported_tools": []
+    },
+    {
+      "slug": "MiniMax-M3",
+      "display_name": "MiniMax M3",
+      "supported_reasoning_levels": [
+        { "effort": "none", "description": "Thinking disabled" },
+        { "effort": "high", "description": "Adaptive thinking (depth is not tunable)" }
+      ],
+      "shell_type": "default",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 6,
       "base_instructions": "",
       "supports_reasoning_summaries": false,
       "support_verbosity": false,

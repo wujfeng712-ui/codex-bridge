@@ -1,0 +1,7 @@
+{
+  "models": [
+    { "slug": "saved-catalog-deployment", "provider": "minimax" },
+    { "slug": "MiniMax-M2.7" },
+    { "slug": "deepseek-v4-pro" }
+  ]
+}
